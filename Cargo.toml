@@ -8,7 +8,8 @@ members = [
     "crates/lim-tools",
     "crates/lim-session",
     "crates/lim-workflow",
-    "crates/lim-cli",
+    "apps/cli",
+    "apps/tui",
     "packs/novel",
 ]
 
@@ -26,6 +27,7 @@ lim-executor = { path = "crates/lim-executor" }
 lim-tools = { path = "crates/lim-tools" }
 lim-session = { path = "crates/lim-session" }
 lim-workflow = { path = "crates/lim-workflow" }
+lim-tui = { path = "apps/tui" }
 novel-pack = { path = "packs/novel" }
 
 # Async runtime

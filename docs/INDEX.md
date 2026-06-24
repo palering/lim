@@ -2,7 +2,32 @@
 
 Project documentation for [lim](../README.md). See [PROGRESS.md](../PROGRESS.md) for current status.
 
-## Directory Structure
+## Repository Structure
+
+```
+lim/
+  Cargo.toml      # workspace root
+
+  crates/         # 核心 library — 可导出的 crate
+    lim-core/
+    lim-llm/
+    lim-agent/
+    lim-executor/
+    lim-tools/
+    lim-session/
+    lim-workflow/
+
+  apps/           # 应用层 — 可运行的前端
+    cli/          # lim 主 binary（子命令分发）
+    tui/          # TUI 前端（骨架，待实现）
+
+  packs/          # 领域扩展 — 特定领域的 lib + bin
+    novel/        # novel-pack（小说创作）
+
+  docs/           # 项目文档（本目录）
+```
+
+## Documentation Directories
 
 | Directory | Purpose |
 |-----------|---------|
