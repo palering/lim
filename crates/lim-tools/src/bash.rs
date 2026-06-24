@@ -45,6 +45,7 @@ impl Tool for BashTool {
         &self,
         tool_call_id: ToolCallId,
         args: serde_json::Value,
+        cancel: CancellationToken,
     ) -> ToolFuture<Result<ToolResult>> {
         let executor = Arc::clone(&self.executor);
         Box::pin(async move {
@@ -64,7 +65,6 @@ impl Tool for BashTool {
                 timeout_secs: 120,
             };
 
-            let cancel = CancellationToken::new();
             let output = executor.run_command(spec, cancel).await?;
             let output_text = output.to_tool_output();
 

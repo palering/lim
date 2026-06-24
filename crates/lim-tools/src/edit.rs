@@ -53,6 +53,7 @@ impl Tool for EditFileTool {
         &self,
         tool_call_id: ToolCallId,
         args: serde_json::Value,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> ToolFuture<Result<ToolResult>> {
         let executor = Arc::clone(&self.executor);
         Box::pin(async move {
