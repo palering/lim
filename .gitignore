@@ -7,3 +7,6 @@ Cargo.lock
 .idea/
 .vscode/
 /sessions/
+
+# Test artifacts from CLI end-to-end runs
+/hello.txt
