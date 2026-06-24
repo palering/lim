@@ -78,15 +78,17 @@ impl ContentBlock {
 
 /// Base64 encoding/decoding for byte vectors in serde.
 mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        // For now, serialize as raw bytes — can switch to base64 crate later.
-        serializer.serialize_bytes(data)
+        let encoded = STANDARD.encode(data);
+        serializer.serialize_str(&encoded)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        Vec::<u8>::deserialize(deserializer)
+        let s = String::deserialize(deserializer)?;
+        STANDARD.decode(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -121,6 +123,26 @@ mod tests {
         match deserialized {
             ContentBlock::Thinking { text } => assert_eq!(text, "let me think..."),
             _ => panic!("expected Thinking block"),
+        }
+    }
+
+    #[test]
+    fn image_block_base64_roundtrip() {
+        let pixels = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]; // fake JPEG header
+        let block = ContentBlock::Image {
+            data: pixels.clone(),
+            mime_type: "image/jpeg".to_string(),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        // Verify it's a base64 string, not a byte array
+        assert!(json.contains("\"data\":\"/9j/4AAQ\""), "expected base64 string in JSON: {json}");
+        let deserialized: ContentBlock = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            ContentBlock::Image { data, mime_type } => {
+                assert_eq!(data, pixels);
+                assert_eq!(mime_type, "image/jpeg");
+            }
+            _ => panic!("expected Image block"),
         }
     }
 }

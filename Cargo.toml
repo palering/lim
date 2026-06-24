@@ -58,6 +58,15 @@ futures = "0.3"
 # Schema validation
 jsonschema = "0.30"
 
+# Base64 encoding
+base64 = "0.22"
+
+# HTTP client for LLM providers
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Async streams
+tokio-stream = "0.1"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
