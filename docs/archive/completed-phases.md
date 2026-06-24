@@ -196,28 +196,6 @@ lim-workflow = "..." # DAG orchestration (optional)
 
 Create sub-agents via `AgentLoop::new()`, share providers via `Arc<dyn Provider>`, coordinate via custom `AgentHooks` implementations, register shared tools in `ToolRegistry`.
 
-### Library Polish Points
-
-Three areas need attention before the library is truly ergonomic for external consumers:
-
-**1. ProviderFactory**
-
-Currently each provider is created via `OpenAiProvider::new()` directly — no unified entry point. Multiple `AgentLoop` instances sharing a provider work (via `Arc<dyn Provider>`), but there's no config-driven factory or connection pooling strategy.
-
-Need: `ProviderFactory` or builder that constructs providers from config, manages shared state (HTTP client, connection pool), and can produce `Arc<dyn Provider>` for multi-agent scenarios.
-
-**2. Session Isolation**
-
-`SessionWriter` takes a filesystem path — parallel sub-agents need distinct session directories. Current `sessions/` directory + `SessionId` already isolates, but there's no explicit session manager that allocates and tracks session lifecycle.
-
-Need: `SessionManager` that creates isolated session directories, provides `SessionWriter` handles, and supports concurrent sub-agent sessions without path conflicts.
-
-**3. Cross-Agent State in WorkflowContext**
-
-`WorkflowContext` uses `Arc<RwLock<HashMap<String, Value>>>` for KV storage. This works for simple data passing but doesn't provide typed channels for structured communication between sub-agents.
-
-Need: enhanced context with typed, channel-based message passing for inter-agent communication, or a dedicated `AgentBus` / message broker pattern for multi-agent coordination.
-
 ## Rust Edition 2024 Pitfalls Encountered
 
 - `std::env::set_var` is `unsafe` (needs `unsafe` block); `std::env::set_current_dir` is NOT
