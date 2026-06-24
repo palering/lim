@@ -37,9 +37,11 @@ lim/
 
 ## Files
 
+- [architecture.md](architecture.md) — Confirmed architectural decisions: frontend/library boundary, directory structure, library exportability.
+
 ### archive/
 
-- [completed-phases.md](archive/completed-phases.md) — Technical details for each completed phase: key patterns, Rust pitfalls, architecture decisions. Referenced from PROGRESS.md.
+- [completed-phases.md](archive/completed-phases.md) — Technical details for each completed phase: key patterns, Rust pitfalls, acceptance criteria. Referenced from PROGRESS.md.
 
 ### draft/
 
