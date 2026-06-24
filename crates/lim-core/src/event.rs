@@ -69,6 +69,18 @@ pub enum AgentEvent {
 
     /// Agent run finished.
     AgentEnd,
+
+    /// Context was compacted to fit within the model's window.
+    ContextCompacted {
+        /// Number of messages before compaction.
+        messages_before: usize,
+        /// Number of messages after compaction (summary + recent).
+        messages_after: usize,
+        /// Estimated tokens before compaction.
+        tokens_before: u64,
+        /// Estimated tokens after compaction.
+        tokens_after: u64,
+    },
 }
 
 /// Envelope wrapping every event with correlation IDs.
