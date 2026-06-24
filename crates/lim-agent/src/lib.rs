@@ -1,1 +1,3 @@
-// lim-agent: Agent loop、tool registry、hooks、取消
+pub mod agent_loop;
+pub mod hooks;
+pub mod registry;
