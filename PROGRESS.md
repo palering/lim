@@ -57,20 +57,6 @@ Acceptance:
 - [ ] TUI renders streaming output without blocking agent loop
 - [ ] Tool approval, cancellation, and steering are interactive
 
-### Library Polish — External API Hardening
-
-Goal: Make lim crates ergonomic and production-ready for external consumers (sub-agents, multi-agent orchestration, third-party integrations).
-
-- ProviderFactory — unified, config-driven provider construction with shared connection pool
-- SessionManager — explicit session lifecycle for concurrent sub-agent isolation
-- WorkflowContext typed channels — structured message-passing for inter-agent communication (beyond KV storage)
-
-Acceptance:
-
-- [ ] Multiple `AgentLoop` instances share one provider via factory without manual wiring
-- [ ] Parallel sub-agent sessions run without path conflicts
-- [ ] WorkflowContext supports typed cross-agent messaging
-
 ### Phase 4: Strong Isolation & External Tools
 
 Goal: L1/L2 isolation and extension system.
