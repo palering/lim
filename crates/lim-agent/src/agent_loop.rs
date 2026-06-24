@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use lim_core::context_edit::{ContextEdit, apply_edit, compose_edits};
 use lim_core::error::{LimError, Result};
 use lim_core::event::{AgentEvent, EventEnvelope};
 use lim_core::id::{BranchId, SessionId, ToolCallId, TraceId, TurnId};
@@ -47,6 +48,9 @@ pub struct AgentLoop {
     registry: Arc<ToolRegistry>,
     hooks: Option<Arc<dyn AgentHooks>>,
     context_window: Option<ContextWindowManager>,
+    /// Persistent user edits loaded from session history.
+    /// Applied before compact on every turn.
+    user_edits: Vec<ContextEdit>,
     event_tx: broadcast::Sender<EventEnvelope>,
     cancel: CancellationToken,
     config: AgentConfig,
@@ -69,6 +73,7 @@ impl AgentLoop {
             registry,
             hooks: None,
             context_window: None,
+            user_edits: Vec::new(),
             event_tx,
             cancel,
             config: AgentConfig::default(),
@@ -95,6 +100,24 @@ impl AgentLoop {
     pub fn with_context_window(mut self, cwm: ContextWindowManager) -> Self {
         self.context_window = Some(cwm);
         self
+    }
+
+    /// Load persistent user edits from session history.
+    ///
+    /// These edits are applied before compact on every turn, so that
+    /// session restore preserves manual context modifications.
+    pub fn with_user_edits(mut self, edits: Vec<ContextEdit>) -> Self {
+        self.user_edits = edits;
+        self
+    }
+
+    /// Apply a new user edit at runtime and persist it via event.
+    ///
+    /// This is called when the user makes an interactive edit via CLI or TUI.
+    pub fn apply_user_edit(&mut self, edit: ContextEdit) -> Result<()> {
+        self.user_edits.push(edit.clone());
+        self.emit(AgentEvent::ContextEdited { edit })?;
+        Ok(())
     }
 
     /// Get the session ID.
@@ -147,9 +170,29 @@ impl AgentLoop {
             self.emit(AgentEvent::TurnStart { turn_id })?;
             debug!(turn = turn_num, "turn started");
 
-            // Build LLM request (with optional context compaction)
+            // Build LLM request through the 3-layer context projection pipeline
+
+            // Layer 1: Loop edit (hooks, transient — not persisted)
+            let working_messages = if let Some(ref hooks) = self.hooks {
+                match hooks.edit_context(&messages).await? {
+                    Some(edit) => apply_edit(&messages, &edit),
+                    None => messages.clone(),
+                }
+            } else {
+                messages.clone()
+            };
+
+            // Layer 2: User edits (persistent, loaded from session history)
+            let working_messages = if !self.user_edits.is_empty() {
+                let composed = compose_edits(&self.user_edits);
+                apply_edit(&working_messages, &composed)
+            } else {
+                working_messages
+            };
+
+            // Layer 3: Automatic compaction (token budget)
             let llm_messages = if let Some(ref cwm) = self.context_window {
-                let compaction = cwm.compact(&messages, &self.provider).await?;
+                let compaction = cwm.compact(&working_messages, &self.provider).await?;
                 if compaction.was_compacted {
                     self.emit(AgentEvent::ContextCompacted {
                         messages_before: compaction.messages_before,
@@ -160,7 +203,7 @@ impl AgentLoop {
                 }
                 compaction.messages
             } else {
-                convert_to_llm(&messages)
+                convert_to_llm(&working_messages)
             };
             let mut request = LlmRequest::new(llm_messages);
             request = request.with_tools(self.registry.schemas());

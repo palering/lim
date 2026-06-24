@@ -81,6 +81,15 @@ pub enum AgentEvent {
         /// Estimated tokens after compaction.
         tokens_after: u64,
     },
+
+    /// Context was manually edited (user or loop hook).
+    ///
+    /// Persisted in the JSONL event log so that edits can be replayed
+    /// on session restore. The edit describes modifications to the
+    /// LLM projection only — the original message history is unchanged.
+    ContextEdited {
+        edit: crate::context_edit::ContextEdit,
+    },
 }
 
 /// Envelope wrapping every event with correlation IDs.

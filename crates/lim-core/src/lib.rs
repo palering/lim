@@ -1,4 +1,5 @@
 pub mod content;
+pub mod context_edit;
 pub mod error;
 pub mod event;
 pub mod id;
@@ -9,6 +10,7 @@ pub mod usage;
 
 // Re-export key types at crate root for ergonomic use.
 pub use content::ContentBlock;
+pub use context_edit::{ContextEdit, apply_edit, compose_edits};
 pub use error::{LimError, Result};
 pub use event::{AgentEvent, EventEnvelope};
 pub use id::{
