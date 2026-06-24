@@ -155,6 +155,69 @@ Fires after tool results are collected, before the next LLM call. Returns `Optio
 - TUI: hotkey triggers interactive selector, or `/edit` command in conversation
 - Both produce the same `ContextEdit` descriptor
 
+## Architecture: Frontend / Library Boundary (Phase 3 discussion)
+
+### TUI as Frontend
+
+TUI is a "frontend" — a presentation layer over the agent loop, parallel to CLI. The current architecture already separates frontends (binary crates) from core libraries (lib crates), so TUI should follow the same pattern.
+
+**Decision: separate `lim-tui` binary crate in workspace.**
+
+- ratatui / crossterm are terminal-specific deps, unrelated to CLI's plain-text output
+- Multiple frontends (CLI, TUI, future web dashboard) each as independent binary crate, sharing core libraries
+- `novel-pack` already validates this model — separate binary consuming lim-agent + lim-workflow
+
+### Library Exportability
+
+Current state: all crates except `lim-cli` are library-only (`[lib]`) with complete `pub use` re-exports. No `publish = false`, no `private = true`.
+
+Dependency graph is unidirectional:
+
+```
+lim-core (leaf)
+  ├── lim-llm
+  ├── lim-executor
+  ├── lim-session
+  ├── lim-agent (→ lim-core, lim-llm)
+  ├── lim-tools (→ lim-core, lim-executor, lim-agent)
+  └── lim-workflow (→ lim-core, lim-llm, lim-agent, lim-session)
+```
+
+External applications import only the layers they need. `novel-pack` proves the model — it depends on `lim-core`, `lim-llm`, `lim-agent`, `lim-workflow`, `lim-tools` and builds its own multi-agent orchestration on top.
+
+Multi-agent / sub-agent usage pattern:
+
+```toml
+[dependencies]
+lim-agent = "..."   # AgentLoop, AgentHooks, ToolRegistry
+lim-llm = "..."     # Provider trait + implementations
+lim-workflow = "..." # DAG orchestration (optional)
+```
+
+Create sub-agents via `AgentLoop::new()`, share providers via `Arc<dyn Provider>`, coordinate via custom `AgentHooks` implementations, register shared tools in `ToolRegistry`.
+
+### Library Polish Points
+
+Three areas need attention before the library is truly ergonomic for external consumers:
+
+**1. ProviderFactory**
+
+Currently each provider is created via `OpenAiProvider::new()` directly — no unified entry point. Multiple `AgentLoop` instances sharing a provider work (via `Arc<dyn Provider>`), but there's no config-driven factory or connection pooling strategy.
+
+Need: `ProviderFactory` or builder that constructs providers from config, manages shared state (HTTP client, connection pool), and can produce `Arc<dyn Provider>` for multi-agent scenarios.
+
+**2. Session Isolation**
+
+`SessionWriter` takes a filesystem path — parallel sub-agents need distinct session directories. Current `sessions/` directory + `SessionId` already isolates, but there's no explicit session manager that allocates and tracks session lifecycle.
+
+Need: `SessionManager` that creates isolated session directories, provides `SessionWriter` handles, and supports concurrent sub-agent sessions without path conflicts.
+
+**3. Cross-Agent State in WorkflowContext**
+
+`WorkflowContext` uses `Arc<RwLock<HashMap<String, Value>>>` for KV storage. This works for simple data passing but doesn't provide typed channels for structured communication between sub-agents.
+
+Need: enhanced context with typed, channel-based message passing for inter-agent communication, or a dedicated `AgentBus` / message broker pattern for multi-agent coordination.
+
 ## Rust Edition 2024 Pitfalls Encountered
 
 - `std::env::set_var` is `unsafe` (needs `unsafe` block); `std::env::set_current_dir` is NOT
