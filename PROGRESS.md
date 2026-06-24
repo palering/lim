@@ -1,7 +1,7 @@
 # lim — Implementation Progress
 
 > Last updated: 2026-06-25
-> Workspace: 9 crates, ~7400 lines Rust, 111 tests, 0 clippy warnings
+> Workspace: 9 crates, ~8200 lines Rust, 122 tests, 0 clippy warnings
 > Details: [docs/archive/completed-phases.md](docs/archive/completed-phases.md)
 
 ## Completed
@@ -30,23 +30,30 @@ Commits `798a460`, `fae6317`. All review items resolved:
 
 Commit `52039a1` | +20 tests (lim-agent: 8→28). Token estimation, compaction algorithm, summary via provider, AgentLoop integration with ContextCompacted event.
 
+### ContextEdit — 3-Layer Context Projection — DONE
+
+Commit `6064e6c` | +11 tests (lim-core: 19→30). Universal `ContextEdit` descriptor (`exclude` + `replace`), pure `apply_edit()` / `compose_edits()` functions, `AgentEvent::ContextEdited` variant, `AgentHooks::edit_context()` extension. AgentLoop integrates the 3-layer pipeline: loop edit (hooks, transient) → user edit (persistent, JSONL) → compact (CWM, token budget).
+
 ## Planned
 
 ### Phase 3: Context Compression & TUI (continued)
 
 Goal: Long-running tasks become interactive, visualizable, and sustainable.
 
-Done: ContextWindowManager (see above).
+Done: ContextWindowManager, ContextEdit (see above).
 
 Remaining:
 
 - lim-tui — ratatui terminal UI with streaming render
 - Approval UI — tool approval, cancellation, steering interaction
 - Cost/usage panel — real-time token tracking
+- CLI `edit-context` subcommand and TUI interactive context editing
+- SessionReader replay of `ContextEdited` events on session restore
 
 Acceptance:
 
 - [x] Long session triggers summary compaction without losing original events
+- [x] ContextEdit composes through 3-layer pipeline without mutating original history
 - [ ] TUI renders streaming output without blocking agent loop
 - [ ] Tool approval, cancellation, and steering are interactive
 
@@ -69,7 +76,7 @@ Acceptance:
 
 | Crate | Layer | Phase | Tests |
 | :--- | :--- | :--- | :--- |
-| lim-core | Foundation | 1 | 19 |
+| lim-core | Foundation | 1+3 | 30 |
 | lim-llm | Foundation | 1 | 13 |
 | lim-agent | Core | 1+3 | 28 |
 | lim-executor | Core | 1 | 6 |
@@ -78,4 +85,4 @@ Acceptance:
 | lim-cli | Entry | 1 | 0 |
 | lim-workflow | Orchestration | 2 | 22 |
 | novel-pack (packs/novel) | Domain | 2 | 15 |
-| **Total** | | | **111** |
+| **Total** | | | **122** |
