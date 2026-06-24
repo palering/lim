@@ -35,6 +35,13 @@ pub struct AgentMessage {
     /// Associated tool call IDs (for Tool role messages).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_call_ids: Vec<ToolCallId>,
+    /// Whether this tool result represents an error (only meaningful for Tool role).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_error: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 impl AgentMessage {
@@ -45,6 +52,7 @@ impl AgentMessage {
             role: Role::User,
             content: vec![ContentBlock::text(text)],
             tool_call_ids: Vec::new(),
+            is_error: false,
         }
     }
 
@@ -55,16 +63,18 @@ impl AgentMessage {
             role: Role::Assistant,
             content,
             tool_call_ids: Vec::new(),
+            is_error: false,
         }
     }
 
     /// Create a tool result message.
-    pub fn tool_result(tool_call_id: ToolCallId, output: impl Into<String>, _is_error: bool) -> Self {
+    pub fn tool_result(tool_call_id: ToolCallId, output: impl Into<String>, is_error: bool) -> Self {
         Self {
             id: MessageId::new(),
             role: Role::Tool,
             content: vec![ContentBlock::text(output)],
             tool_call_ids: vec![tool_call_id],
+            is_error,
         }
     }
 
@@ -75,6 +85,7 @@ impl AgentMessage {
             role: Role::System,
             content: vec![ContentBlock::text(text)],
             tool_call_ids: Vec::new(),
+            is_error: false,
         }
     }
 

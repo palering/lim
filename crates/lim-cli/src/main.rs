@@ -39,25 +39,6 @@ enum Commands {
         #[arg(long)]
         output: Option<Utf8PathBuf>,
     },
-
-    /// Generate a chapter using the novel-pack workflow.
-    Chapter {
-        /// Path to the story bible JSON file.
-        #[arg(long)]
-        bible: Utf8PathBuf,
-
-        /// Path to the chapter outline JSON file.
-        #[arg(long)]
-        outline: Utf8PathBuf,
-
-        /// Path to the MockProvider responses JSON file.
-        #[arg(long)]
-        responses: Utf8PathBuf,
-
-        /// Output directory for artifacts (defaults to sessions/artifacts/).
-        #[arg(long)]
-        output: Option<Utf8PathBuf>,
-    },
 }
 
 /// Fixture format for MockProvider scripted responses.
@@ -130,14 +111,6 @@ async fn main() -> anyhow::Result<()> {
             output,
         } => {
             run_session(fake, message, output).await?;
-        }
-        Commands::Chapter {
-            bible,
-            outline,
-            responses,
-            output,
-        } => {
-            run_chapter(bible, outline, responses, output).await?;
         }
     }
 
@@ -300,121 +273,4 @@ fn chrono_lite_timestamp() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
     format!("{}", now.as_secs())
-}
-
-/// Load a JSON file and deserialize it.
-fn load_json<T: serde::de::DeserializeOwned>(path: &Utf8PathBuf) -> Result<T> {
-    let content = std::fs::read_to_string(path.as_std_path()).map_err(|e| {
-        lim_core::error::LimError::ToolExecution {
-            name: "file_loader".to_string(),
-            message: format!("failed to read `{path}`: {e}"),
-        }
-    })?;
-    serde_json::from_str(&content).map_err(|e| {
-        lim_core::error::LimError::ToolExecution {
-            name: "json_parser".to_string(),
-            message: format!("failed to parse `{path}`: {e}"),
-        }
-    })
-}
-
-async fn run_chapter(
-    bible_path: Utf8PathBuf,
-    outline_path: Utf8PathBuf,
-    responses_path: Utf8PathBuf,
-    output_dir: Option<Utf8PathBuf>,
-) -> Result<()> {
-    // Load inputs
-    let bible: novel_pack::StoryBible = load_json(&bible_path)?;
-    let outline: novel_pack::ChapterOutline = load_json(&outline_path)?;
-    let responses: Vec<MockResponse> = load_fixture(&responses_path)?;
-
-    println!("Story: \"{}\" ({})", bible.title, bible.genre);
-    println!(
-        "Chapter {}: {} ({} scenes)",
-        outline.chapter_number,
-        outline.summary,
-        outline.scenes.len()
-    );
-    println!("Loaded {} scripted responses", responses.len());
-
-    // Build workflow graph
-    let graph = novel_pack::build_chapter_workflow(&bible, &outline);
-    let levels = graph.topological_order()?;
-    println!(
-        "Workflow: {} nodes in {} levels",
-        graph.node_ids().len(),
-        levels.len()
-    );
-
-    // Create provider and registry
-    let provider = Arc::new(MockProvider::new(responses));
-    let registry = Arc::new(ToolRegistry::new());
-
-    // Create artifact store
-    let artifact_dir = output_dir.unwrap_or_else(|| Utf8PathBuf::from("sessions/artifacts"));
-    std::fs::create_dir_all(artifact_dir.as_std_path()).ok();
-    let artifact_store = Arc::new(lim_workflow::ArtifactStore::new(artifact_dir.clone()));
-
-    // Create workflow event channel and cancellation token
-    let (wf_event_tx, _wf_event_rx) = broadcast::channel(100);
-    let cancel = CancellationToken::new();
-
-    // Create executor
-    let executor = lim_workflow::WorkflowExecutor::new(
-        provider,
-        registry,
-        artifact_store.clone(),
-        cancel,
-        wf_event_tx,
-    );
-
-    // Create initial context
-    let context = lim_workflow::WorkflowContext::new();
-
-    // Execute workflow
-    println!("\n--- Executing workflow ---\n");
-    let final_context = executor.execute(&graph, context).await?;
-
-    // Print results
-    println!("\n--- Workflow Results ---");
-
-    // Print scene drafts
-    for scene in &outline.scenes {
-        let node_id = format!("scene_{}_loop", scene.scene_number);
-        if let Some(output) = final_context.get_output(&node_id) {
-            println!("\nScene {} ({}):", scene.scene_number, scene.setting);
-            if let lim_workflow::NodeOutput::Data(v) = &output
-                && let Some(draft) = v.get("draft").and_then(|d| d.as_str())
-            {
-                let preview = if draft.len() > 200 {
-                    format!("{}...", &draft[..200])
-                } else {
-                    draft.to_string()
-                };
-                println!("  Draft: {preview}");
-            }
-        }
-    }
-
-    // Print chapter output
-    if let Some(chapter_output) = final_context.get_output("chapter") {
-        println!("\n--- Final Chapter ---");
-        if let lim_workflow::NodeOutput::Data(v) = &chapter_output
-            && let Some(text) = v.get("text").and_then(|t| t.as_str())
-        {
-            println!("{text}");
-        }
-    }
-
-    // List artifacts
-    let artifacts = artifact_store.list().await?;
-    println!("\n--- Artifacts ---");
-    println!("{} artifacts stored in {artifact_dir}/", artifacts.len());
-    for artifact in &artifacts {
-        println!("  {} ({})", artifact.id, artifact.kind);
-    }
-
-    println!("\nChapter generation complete.");
-    Ok(())
 }

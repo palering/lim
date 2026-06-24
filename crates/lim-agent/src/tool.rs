@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use tokio_util::sync::CancellationToken;
+
 use lim_core::error::Result;
 use lim_core::tool::{ToolResult, ToolSchema};
 
@@ -19,9 +21,13 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> ToolSchema;
 
     /// Execute the tool with validated arguments.
+    ///
+    /// The `cancel` token is derived from the agent loop's token and should
+    /// be forwarded to any long-running operations (e.g., shell commands).
     fn execute(
         &self,
         tool_call_id: lim_core::ToolCallId,
         args: serde_json::Value,
+        cancel: CancellationToken,
     ) -> ToolFuture<Result<ToolResult>>;
 }

@@ -113,6 +113,7 @@ impl StreamAccumulator {
             role: Role::Assistant,
             content,
             tool_call_ids: Vec::new(),
+            is_error: false,
         };
 
         (message, self.usage, self.stop_reason)

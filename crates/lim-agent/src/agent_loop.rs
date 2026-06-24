@@ -319,7 +319,7 @@ impl AgentLoop {
             let tool = self.registry.get(name).ok_or_else(|| {
                 LimError::UnknownTool(name.to_string())
             })?;
-            tool.execute(tc_id, args).await?
+            tool.execute(tc_id, args, self.cancel.clone()).await?
         };
 
         self.emit(AgentEvent::ToolExecutionEnd {
@@ -368,6 +368,7 @@ mod tests {
             &self,
             tc_id: ToolCallId,
             args: serde_json::Value,
+            _cancel: CancellationToken,
         ) -> crate::tool::ToolFuture<Result<ToolResult>> {
             Box::pin(async move {
                 let text = args

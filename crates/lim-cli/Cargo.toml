@@ -10,8 +10,6 @@ lim-agent = { workspace = true }
 lim-executor = { workspace = true }
 lim-tools = { workspace = true }
 lim-session = { workspace = true }
-lim-workflow = { workspace = true }
-novel-pack = { workspace = true }
 anyhow = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }
