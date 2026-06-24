@@ -1,0 +1,17 @@
+{
+  "title": "The Last Signal",
+  "genre": "Science Fiction",
+  "characters": [
+    {
+      "name": "Captain Zara Okafor",
+      "role": "Protagonist",
+      "description": "A seasoned deep-space captain known for calm judgment and dry humor. She carries guilt from a past mission gone wrong."
+    },
+    {
+      "name": "Kai",
+      "role": "Ship AI",
+      "description": "The ship's artificial intelligence, loyal and slightly sardonic. Communicates through holographic displays."
+    }
+  ],
+  "world_notes": "Set aboard the research vessel Meridian, drifting through uncharted space near the Veil Nebula. Humanity has FTL travel but no contact with alien life — until now."
+}

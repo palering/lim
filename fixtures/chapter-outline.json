@@ -1,0 +1,39 @@
+{
+  "chapter_number": 1,
+  "summary": "Captain Zara detects an anomalous signal from within the Veil Nebula and must decide whether to investigate.",
+  "scenes": [
+    {
+      "scene_number": 1,
+      "setting": "Bridge of the Meridian, night cycle",
+      "characters": ["Captain Zara Okafor", "Kai"],
+      "purpose": "Establish the protagonist and the inciting incident",
+      "key_events": [
+        "Zara is reviewing old mission logs when an alert sounds",
+        "Kai reports an anomalous signal from inside the Veil Nebula",
+        "The signal appears to be structured — possibly artificial"
+      ]
+    },
+    {
+      "scene_number": 2,
+      "setting": "Engineering bay",
+      "characters": ["Captain Zara Okafor"],
+      "purpose": "Show Zara's internal conflict about the mission",
+      "key_events": [
+        "Zara inspects the ship's systems, checking if they can handle the nebula",
+        "She recalls the failed mission that haunts her",
+        "She resolves to investigate despite the risk"
+      ]
+    },
+    {
+      "scene_number": 3,
+      "setting": "Bridge of the Meridian, approach to the Veil Nebula",
+      "characters": ["Captain Zara Okafor", "Kai"],
+      "purpose": "Begin the journey into the unknown",
+      "key_events": [
+        "Zara gives the order to change course toward the signal",
+        "Kai plots the course and warns of nebula hazards",
+        "The Meridian enters the outer edge of the Veil Nebula"
+      ]
+    }
+  ]
+}

@@ -7,6 +7,8 @@ members = [
     "crates/lim-executor",
     "crates/lim-tools",
     "crates/lim-session",
+    "crates/lim-workflow",
+    "crates/novel-pack",
     "crates/lim-cli",
 ]
 
@@ -23,6 +25,8 @@ lim-agent = { path = "crates/lim-agent" }
 lim-executor = { path = "crates/lim-executor" }
 lim-tools = { path = "crates/lim-tools" }
 lim-session = { path = "crates/lim-session" }
+lim-workflow = { path = "crates/lim-workflow" }
+novel-pack = { path = "crates/novel-pack" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

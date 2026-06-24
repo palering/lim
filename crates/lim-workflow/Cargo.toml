@@ -1,0 +1,18 @@
+[package]
+name = "lim-workflow"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lim-core = { workspace = true }
+lim-llm = { workspace = true }
+lim-agent = { workspace = true }
+lim-session = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+camino = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
