@@ -1,0 +1,12 @@
+[package]
+name = "lim-cli"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lim-core = { workspace = true }
+lim-llm = { workspace = true }
+lim-agent = { workspace = true }
+lim-executor = { workspace = true }
+lim-tools = { workspace = true }
+lim-session = { workspace = true }

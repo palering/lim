@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/lim-core",
+    "crates/lim-llm",
+    "crates/lim-agent",
+    "crates/lim-executor",
+    "crates/lim-tools",
+    "crates/lim-session",
+    "crates/lim-cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/user/lim"
+
+[workspace.dependencies]
+# Internal crates
+lim-core = { path = "crates/lim-core" }
+lim-llm = { path = "crates/lim-llm" }
+lim-agent = { path = "crates/lim-agent" }
+lim-executor = { path = "crates/lim-executor" }
+lim-tools = { path = "crates/lim-tools" }
+lim-session = { path = "crates/lim-session" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# IDs
+ulid = { version = "1", features = ["serde"] }
+
+# Paths
+camino = { version = "1", features = ["serde1"] }
+
+# Logging
+tracing = "0.1"
+
+# Schema generation
+schemars = "0.8"
+
+# Async streams
+futures = "0.3"
