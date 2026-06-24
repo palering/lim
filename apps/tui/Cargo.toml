@@ -1,0 +1,9 @@
+[package]
+name = "lim-tui"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lim-core = { workspace = true }
+lim-agent = { workspace = true }
+lim-llm = { workspace = true }

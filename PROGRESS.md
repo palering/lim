@@ -1,7 +1,7 @@
 # lim — Implementation Progress
 
 > Last updated: 2026-06-25
-> Workspace: 9 crates, ~8200 lines Rust, 122 tests, 0 clippy warnings
+> Workspace: 10 crates, ~8200 lines Rust, 122 tests, 0 clippy warnings
 > Details: [docs/archive/completed-phases.md](docs/archive/completed-phases.md)
 
 ## Completed
@@ -82,7 +82,8 @@ Acceptance:
 | lim-executor | Core | 1 | 6 |
 | lim-tools | Core | 1 | 0 |
 | lim-session | Core | 1 | 8 |
-| lim-cli | Entry | 1 | 0 |
 | lim-workflow | Orchestration | 2 | 22 |
+| lim (apps/cli) | Entry | 1 | 0 |
+| lim-tui (apps/tui) | Frontend | 3 | 0 |
 | novel-pack (packs/novel) | Domain | 2 | 15 |
 | **Total** | | | **122** |
