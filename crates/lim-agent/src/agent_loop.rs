@@ -15,6 +15,7 @@ use lim_core::tool::{ToolCall, ToolResult};
 use lim_llm::provider::{LlmRequest, Provider};
 use lim_llm::stream::StreamEvent;
 
+use crate::context_window::ContextWindowManager;
 use crate::hooks::{AgentHooks, BeforeToolDecision};
 use crate::registry::{ToolRegistry, validate_args};
 use crate::stream_accumulator::StreamAccumulator;
@@ -45,6 +46,7 @@ pub struct AgentLoop {
     provider: Arc<dyn Provider>,
     registry: Arc<ToolRegistry>,
     hooks: Option<Arc<dyn AgentHooks>>,
+    context_window: Option<ContextWindowManager>,
     event_tx: broadcast::Sender<EventEnvelope>,
     cancel: CancellationToken,
     config: AgentConfig,
@@ -66,6 +68,7 @@ impl AgentLoop {
             provider,
             registry,
             hooks: None,
+            context_window: None,
             event_tx,
             cancel,
             config: AgentConfig::default(),
@@ -85,6 +88,12 @@ impl AgentLoop {
     /// Set agent configuration.
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Set the context window manager for automatic compaction.
+    pub fn with_context_window(mut self, cwm: ContextWindowManager) -> Self {
+        self.context_window = Some(cwm);
         self
     }
 
@@ -138,8 +147,21 @@ impl AgentLoop {
             self.emit(AgentEvent::TurnStart { turn_id })?;
             debug!(turn = turn_num, "turn started");
 
-            // Build LLM request
-            let llm_messages = convert_to_llm(&messages);
+            // Build LLM request (with optional context compaction)
+            let llm_messages = if let Some(ref cwm) = self.context_window {
+                let compaction = cwm.compact(&messages, &self.provider).await?;
+                if compaction.was_compacted {
+                    self.emit(AgentEvent::ContextCompacted {
+                        messages_before: compaction.messages_before,
+                        messages_after: compaction.messages_after,
+                        tokens_before: compaction.tokens_before,
+                        tokens_after: compaction.tokens_after,
+                    })?;
+                }
+                compaction.messages
+            } else {
+                convert_to_llm(&messages)
+            };
             let mut request = LlmRequest::new(llm_messages);
             request = request.with_tools(self.registry.schemas());
             if let Some(ref system) = self.config.system_prompt {
