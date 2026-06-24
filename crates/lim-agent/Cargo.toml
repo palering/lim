@@ -6,3 +6,10 @@ edition.workspace = true
 [dependencies]
 lim-core = { workspace = true }
 lim-llm = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+jsonschema = { workspace = true }

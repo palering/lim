@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 lim-core = { workspace = true }
 lim-executor = { workspace = true }
+lim-agent = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+camino = { workspace = true }
+serde_json = { workspace = true }

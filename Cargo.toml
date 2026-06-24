@@ -50,3 +50,12 @@ schemars = "0.8"
 
 # Async streams
 futures = "0.3"
+
+# Schema validation
+jsonschema = "0.30"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging output
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

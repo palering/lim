@@ -10,3 +10,12 @@ lim-agent = { workspace = true }
 lim-executor = { workspace = true }
 lim-tools = { workspace = true }
 lim-session = { workspace = true }
+anyhow = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+camino = { workspace = true }

@@ -1,0 +1,13 @@
+[
+  {
+    "type": "tool_calls",
+    "text": "Let me check the file.",
+    "calls": [
+      { "name": "read", "arguments": { "path": "hello.txt" } }
+    ]
+  },
+  {
+    "type": "text",
+    "text": "The file contains: hello world"
+  }
+]

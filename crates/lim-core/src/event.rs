@@ -74,6 +74,11 @@ pub enum AgentEvent {
 /// Envelope wrapping every event with correlation IDs.
 ///
 /// This is what gets written to the JSONL event log.
+///
+/// Note: `turn_id`, `message_id`, and `tool_call_id` are not serialized
+/// because they can conflict with the same fields inside the flattened
+/// `AgentEvent`. They are recomputed from the event on deserialization
+/// via `extract_ids`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
     /// Monotonically increasing sequence number within the session.
@@ -82,14 +87,14 @@ pub struct EventEnvelope {
     pub session_id: SessionId,
     /// The branch within the session.
     pub branch_id: BranchId,
-    /// Current turn (if applicable).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Current turn (recomputed from event, not serialized).
+    #[serde(skip, default)]
     pub turn_id: Option<TurnId>,
-    /// Current message (if applicable).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Current message (recomputed from event, not serialized).
+    #[serde(skip, default)]
     pub message_id: Option<MessageId>,
-    /// Current tool call (if applicable).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Current tool call (recomputed from event, not serialized).
+    #[serde(skip, default)]
     pub tool_call_id: Option<ToolCallId>,
     /// Trace ID for correlating across runs.
     pub trace_id: TraceId,
@@ -118,6 +123,18 @@ impl EventEnvelope {
             trace_id,
             event,
         }
+    }
+
+    /// Recompute correlation IDs from the event payload.
+    ///
+    /// Call this after deserialization, since `turn_id`, `message_id`,
+    /// and `tool_call_id` are skipped during serde to avoid conflicts
+    /// with the flattened event.
+    pub fn recompute_ids(&mut self) {
+        let (turn_id, message_id, tool_call_id) = extract_ids(&self.event);
+        self.turn_id = turn_id;
+        self.message_id = message_id;
+        self.tool_call_id = tool_call_id;
     }
 }
 

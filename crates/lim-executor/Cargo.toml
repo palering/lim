@@ -5,3 +5,12 @@ edition.workspace = true
 
 [dependencies]
 lim-core = { workspace = true }
+camino = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
