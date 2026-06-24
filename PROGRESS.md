@@ -1,7 +1,7 @@
 # lim — Implementation Progress
 
 > Last updated: 2026-06-25
-> Workspace: 9 crates, ~6600 lines Rust, 91 tests, 0 clippy warnings
+> Workspace: 9 crates, ~7400 lines Rust, 111 tests, 0 clippy warnings
 > Details: [docs/archive/completed-phases.md](docs/archive/completed-phases.md)
 
 ## Completed
@@ -26,20 +26,27 @@ Commits `798a460`, `fae6317`. All review items resolved:
 | P1 | Image block raw bytes | base64 encoding (base64 0.22) |
 | P1 | No real LLM provider | OpenAiProvider with SSE streaming |
 
+### ContextWindowManager — DONE
+
+Commit `52039a1` | +20 tests (lim-agent: 8→28). Token estimation, compaction algorithm, summary via provider, AgentLoop integration with ContextCompacted event.
+
 ## Planned
 
-### Phase 3: Context Compression & TUI
+### Phase 3: Context Compression & TUI (continued)
 
 Goal: Long-running tasks become interactive, visualizable, and sustainable.
 
-- ContextWindowManager — summarize older turns, preserve raw JSONL
+Done: ContextWindowManager (see above).
+
+Remaining:
+
 - lim-tui — ratatui terminal UI with streaming render
 - Approval UI — tool approval, cancellation, steering interaction
 - Cost/usage panel — real-time token tracking
 
 Acceptance:
 
-- [ ] Long session triggers summary compaction without losing original events
+- [x] Long session triggers summary compaction without losing original events
 - [ ] TUI renders streaming output without blocking agent loop
 - [ ] Tool approval, cancellation, and steering are interactive
 
@@ -64,11 +71,11 @@ Acceptance:
 | :--- | :--- | :--- | :--- |
 | lim-core | Foundation | 1 | 19 |
 | lim-llm | Foundation | 1 | 13 |
-| lim-agent | Core | 1 | 8 |
+| lim-agent | Core | 1+3 | 28 |
 | lim-executor | Core | 1 | 6 |
 | lim-tools | Core | 1 | 0 |
 | lim-session | Core | 1 | 8 |
 | lim-cli | Entry | 1 | 0 |
 | lim-workflow | Orchestration | 2 | 22 |
 | novel-pack (packs/novel) | Domain | 2 | 15 |
-| **Total** | | | **91** |
+| **Total** | | | **111** |
