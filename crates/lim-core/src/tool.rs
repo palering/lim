@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn tool_result_success() {
         let id = ToolCallId::new();
-        let result = ToolResult::success(id, "file contents here");
+        let result = ToolResult::success(id.clone(), "file contents here");
         assert!(!result.is_error);
         assert_eq!(result.tool_call_id, id);
     }

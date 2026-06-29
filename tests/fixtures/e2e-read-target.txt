@@ -1,0 +1,2 @@
+E2E test file, safe to read.
+This file is used by the end-to-end test suite to verify the read tool.

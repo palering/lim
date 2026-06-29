@@ -168,15 +168,15 @@ fn extract_ids(event: &AgentEvent) -> (Option<TurnId>, Option<MessageId>, Option
         AgentEvent::MessageUpdate { message_id, .. } => (None, Some(*message_id), None),
         AgentEvent::MessageEnd { message_id, .. } => (None, Some(*message_id), None),
         AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
-            (None, None, Some(*tool_call_id))
+            (None, None, Some(tool_call_id.clone()))
         }
         AgentEvent::ToolExecutionUpdate { tool_call_id, .. } => {
-            (None, None, Some(*tool_call_id))
+            (None, None, Some(tool_call_id.clone()))
         }
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
             result: _,
-        } => (None, None, Some(*tool_call_id)),
+        } => (None, None, Some(tool_call_id.clone())),
         _ => (None, None, None),
     }
 }
@@ -214,7 +214,7 @@ mod tests {
     fn extract_ids_tool_execution() {
         let tc_id = ToolCallId::new();
         let event = AgentEvent::ToolExecutionStart {
-            tool_call_id: tc_id,
+            tool_call_id: tc_id.clone(),
             tool_name: "bash".to_string(),
         };
         let (tid, mid, tcid) = extract_ids(&event);

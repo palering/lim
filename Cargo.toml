@@ -74,3 +74,13 @@ clap = { version = "4", features = ["derive"] }
 
 # Logging output
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# SSE parsing
+eventsource-stream = "0.2"
+
+# TOML config
+toml = "0.8"
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }

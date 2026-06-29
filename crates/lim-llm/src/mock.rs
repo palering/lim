@@ -1,12 +1,12 @@
 use futures::stream::{self, BoxStream, StreamExt};
 
-use lim_core::error::Result;
 use lim_core::id::ToolCallId;
 use lim_core::stop_reason::StopReason;
 use lim_core::usage::Usage;
 
+use crate::error::ProviderError;
 use crate::model::{ModelId, ModelMetadata};
-use crate::provider::LlmRequest;
+use crate::provider::{LlmRequest, Provider};
 use crate::stream::StreamEvent;
 
 /// A scripted response that the [`MockProvider`] can return.
@@ -48,7 +48,6 @@ impl MockToolCall {
 /// the next response. If the queue is empty, returns an error.
 pub struct MockProvider {
     responses: std::sync::Mutex<Vec<MockResponse>>,
-    model_id: ModelId,
 }
 
 impl MockProvider {
@@ -56,7 +55,6 @@ impl MockProvider {
     pub fn new(responses: Vec<MockResponse>) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses),
-            model_id: ModelId::new("mock-test"),
         }
     }
 
@@ -66,11 +64,11 @@ impl MockProvider {
     }
 }
 
-impl super::provider::Provider for MockProvider {
+impl Provider for MockProvider {
     fn stream<'a>(
         &'a self,
         _request: LlmRequest,
-    ) -> BoxStream<'a, Result<StreamEvent>> {
+    ) -> BoxStream<'a, Result<StreamEvent, ProviderError>> {
         let response = {
             let mut queue = self.responses.lock().unwrap();
             if queue.is_empty() {
@@ -82,7 +80,7 @@ impl super::provider::Provider for MockProvider {
 
         match response {
             None => {
-                let err = lim_core::error::LimError::Provider(
+                let err = ProviderError::Stream(
                     "MockProvider: no more scripted responses".to_string(),
                 );
                 stream::once(async move { Err(err) }).boxed()
@@ -98,7 +96,7 @@ impl super::provider::Provider for MockProvider {
                 stream::iter(events).boxed()
             }
             Some(MockResponse::ToolCalls { text, calls }) => {
-                let mut events: Vec<Result<StreamEvent>> = Vec::new();
+                let mut events: Vec<Result<StreamEvent, ProviderError>> = Vec::new();
 
                 if let Some(text) = text {
                     events.push(Ok(StreamEvent::TextDelta { text }));
@@ -107,8 +105,8 @@ impl super::provider::Provider for MockProvider {
                 for call in calls {
                     let tc_id = ToolCallId::new();
                     events.push(Ok(StreamEvent::ToolCallStart {
-                        id: tc_id,
-                        name: call.name,
+                        id: tc_id.clone(),
+                        name: Some(call.name),
                     }));
                     events.push(Ok(StreamEvent::ToolCallDelta {
                         id: tc_id,
@@ -126,9 +124,9 @@ impl super::provider::Provider for MockProvider {
         }
     }
 
-    fn model_metadata(&self) -> ModelMetadata {
+    fn model_metadata(&self, _model: &str) -> ModelMetadata {
         ModelMetadata {
-            id: self.model_id.clone(),
+            id: ModelId::new("mock-test"),
             display_name: "Mock Provider".to_string(),
             context_window: 128_000,
             max_output_tokens: 8_192,
@@ -141,19 +139,20 @@ impl super::provider::Provider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Provider;
-    use futures::StreamExt;
     use lim_core::content::ContentBlock;
     use lim_core::message::LlmMessage;
 
     #[tokio::test]
     async fn mock_text_response() {
         let provider = MockProvider::new(vec![MockResponse::Text("Hello!".to_string())]);
-        let request = LlmRequest::new(vec![LlmMessage {
-            role: lim_core::message::Role::User,
-            content: vec![ContentBlock::text("hi")],
-            tool_call_ids: vec![],
-        }]);
+        let request = LlmRequest::new(
+            "mock",
+            vec![LlmMessage {
+                role: lim_core::message::Role::User,
+                content: vec![ContentBlock::text("hi")],
+                tool_call_ids: vec![],
+            }],
+        );
 
         let events: Vec<_> = provider.stream(request).collect().await;
         assert_eq!(events.len(), 3);
@@ -175,7 +174,7 @@ mod tests {
             calls: vec![MockToolCall::new("bash", serde_json::json!({"cmd": "ls"}))],
         }]);
 
-        let request = LlmRequest::new(vec![]);
+        let request = LlmRequest::new("mock", vec![]);
         let events: Vec<_> = provider.stream(request).collect().await;
 
         // text + tool_call_start + tool_call_delta + usage + done = 5
@@ -183,7 +182,9 @@ mod tests {
 
         // Verify tool call start
         match &events[1] {
-            Ok(StreamEvent::ToolCallStart { name, .. }) => assert_eq!(name, "bash"),
+            Ok(StreamEvent::ToolCallStart { name, .. }) => {
+                assert_eq!(name.as_deref(), Some("bash"));
+            }
             _ => panic!("expected ToolCallStart"),
         }
     }
@@ -191,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn mock_empty_provider_errors() {
         let provider = MockProvider::empty();
-        let request = LlmRequest::new(vec![]);
+        let request = LlmRequest::new("mock", vec![]);
         let events: Vec<_> = provider.stream(request).collect().await;
         assert_eq!(events.len(), 1);
         assert!(events[0].is_err());

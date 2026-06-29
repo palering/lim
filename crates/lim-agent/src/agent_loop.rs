@@ -28,6 +28,9 @@ pub struct AgentConfig {
     pub max_turns: usize,
     /// System prompt to include in every request.
     pub system_prompt: Option<String>,
+    /// Model name to send in each [`LlmRequest`]. The provider no longer holds
+    /// a model; each request specifies which model to call.
+    pub model: String,
 }
 
 impl Default for AgentConfig {
@@ -35,6 +38,7 @@ impl Default for AgentConfig {
         Self {
             max_turns: 20,
             system_prompt: None,
+            model: String::new(),
         }
     }
 }
@@ -94,6 +98,20 @@ impl AgentLoop {
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Update the model name at runtime (takes effect on the next turn).
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.config.model = model.into();
+    }
+
+    /// Replace the provider at runtime (takes effect on the next turn).
+    ///
+    /// Use this to switch between providers (e.g. OpenAI → Anthropic) without
+    /// restarting the session. The conversation history is preserved; only
+    /// the underlying LLM backend changes.
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
     }
 
     /// Set the context window manager for automatic compaction.
@@ -157,6 +175,63 @@ impl AgentLoop {
 
         let mut messages: Vec<AgentMessage> = vec![initial_message];
 
+        self.run_inner(&mut messages).await?;
+        Ok(messages)
+    }
+
+    /// Continue an agent session from a prior message history.
+    ///
+    /// The `prior_messages` are emitted as `MessageEnd` events so the new
+    /// session JSONL is self-contained (the new file holds the full
+    /// conversation, not just the new turn). The `new_user_message` is
+    /// emitted next and becomes the next turn's input.
+    ///
+    /// Use this to implement `--resume <session.jsonl>`: load the prior
+    /// session's messages via `replay_transcript`, then call
+    /// `run_continue(prior, new_msg)`.
+    ///
+    /// Returns all messages (prior + new) at the end.
+    pub async fn run_continue(
+        &mut self,
+        prior_messages: Vec<AgentMessage>,
+        new_user_message: AgentMessage,
+    ) -> Result<Vec<AgentMessage>> {
+        // Re-emit prior messages so the new session JSONL is self-contained.
+        // This mirrors what `run` does for its initial message.
+        for msg in &prior_messages {
+            self.emit(AgentEvent::MessageEnd {
+                message_id: msg.id,
+                message: msg.clone(),
+            })?;
+        }
+
+        // Re-emit persisted user edits so the new session JSONL preserves the
+        // full edit history. Without this, resuming from a resumed session
+        // (A → B → C) would lose A's edits in C, because `replay_edits(B)`
+        // would return an empty list.
+        //
+        // Clone the edits out first to avoid borrowing `self` across the
+        // mutable `emit()` call.
+        let edits_to_replay: Vec<ContextEdit> = self.user_edits.clone();
+        for edit in edits_to_replay {
+            self.emit(AgentEvent::ContextEdited { edit })?;
+        }
+
+        // Emit the new user message as a fresh event.
+        self.emit(AgentEvent::MessageEnd {
+            message_id: new_user_message.id,
+            message: new_user_message.clone(),
+        })?;
+
+        let mut messages: Vec<AgentMessage> = prior_messages;
+        messages.push(new_user_message);
+
+        self.run_inner(&mut messages).await?;
+        Ok(messages)
+    }
+
+    /// Shared inner loop used by both `run` and `run_continue`.
+    async fn run_inner(&mut self, messages: &mut Vec<AgentMessage>) -> Result<()> {
         self.emit(AgentEvent::AgentStart)?;
         info!(session_id = %self.session_id, "agent started");
 
@@ -174,8 +249,8 @@ impl AgentLoop {
 
             // Layer 1: Loop edit (hooks, transient — not persisted)
             let working_messages = if let Some(ref hooks) = self.hooks {
-                match hooks.edit_context(&messages).await? {
-                    Some(edit) => apply_edit(&messages, &edit),
+                match hooks.edit_context(messages).await? {
+                    Some(edit) => apply_edit(messages, &edit),
                     None => messages.clone(),
                 }
             } else {
@@ -192,7 +267,9 @@ impl AgentLoop {
 
             // Layer 3: Automatic compaction (token budget)
             let llm_messages = if let Some(ref cwm) = self.context_window {
-                let compaction = cwm.compact(&working_messages, &self.provider).await?;
+                let compaction = cwm
+                    .compact(&working_messages, &self.provider, &self.config.model)
+                    .await?;
                 if compaction.was_compacted {
                     self.emit(AgentEvent::ContextCompacted {
                         messages_before: compaction.messages_before,
@@ -205,7 +282,7 @@ impl AgentLoop {
             } else {
                 convert_to_llm(&working_messages)
             };
-            let mut request = LlmRequest::new(llm_messages);
+            let mut request = LlmRequest::new(&self.config.model, llm_messages);
             request = request.with_tools(self.registry.schemas());
             if let Some(ref system) = self.config.system_prompt {
                 request = request.with_system(system.clone());
@@ -296,7 +373,7 @@ impl AgentLoop {
         self.emit(AgentEvent::AgentEnd)?;
         info!(session_id = %self.session_id, "agent ended");
 
-        Ok(messages)
+        Ok(())
     }
 
     /// Execute all tool calls in an assistant message.
@@ -316,7 +393,7 @@ impl AgentLoop {
                 continue;
             }
 
-            let result = self.execute_single_tool_call(tc_id, name, arguments).await;
+            let result = self.execute_single_tool_call(tc_id.clone(), name, arguments).await;
 
             match result {
                 Ok(tool_result) => {
@@ -340,7 +417,7 @@ impl AgentLoop {
         arguments: &serde_json::Value,
     ) -> Result<ToolResult> {
         let tool_call = ToolCall {
-            id: tc_id,
+            id: tc_id.clone(),
             name: name.to_string(),
             arguments: arguments.clone(),
         };
@@ -374,7 +451,7 @@ impl AgentLoop {
 
         // Emit start event
         self.emit(AgentEvent::ToolExecutionStart {
-            tool_call_id: tc_id,
+            tool_call_id: tc_id.clone(),
             tool_name: name.to_string(),
         })?;
 
@@ -384,7 +461,7 @@ impl AgentLoop {
             let tool = self.registry.get(name).ok_or_else(|| {
                 LimError::UnknownTool(name.to_string())
             })?;
-            tool.execute(tc_id, args, self.cancel.clone()).await?
+            tool.execute(tc_id.clone(), args, self.cancel.clone()).await?
         };
 
         self.emit(AgentEvent::ToolExecutionEnd {
@@ -585,5 +662,60 @@ mod tests {
             }
             _ => panic!("expected text content"),
         }
+    }
+
+    /// Verify that `run_continue` re-emits ContextEdited events so the new
+    /// session JSONL preserves the full edit history. Without this, resuming
+    /// from a resumed session (A → B → C) would lose A's edits in C because
+    /// `replay_edits(B)` would return an empty list.
+    #[tokio::test]
+    async fn run_continue_replays_context_edits() {
+        use lim_core::context_edit::ContextEdit;
+        use std::collections::HashSet;
+
+        let provider = Arc::new(MockProvider::new(vec![
+            MockResponse::Text("First response".to_string()),
+        ]));
+
+        let registry = Arc::new(ToolRegistry::new());
+        let (event_tx, mut event_rx) = broadcast::channel(100);
+        let cancel = CancellationToken::new();
+
+        // Set up user edits that should be re-emitted on run_continue.
+        let edit = ContextEdit {
+            exclude: HashSet::from([0]),
+            ..Default::default()
+        };
+
+        let mut agent = AgentLoop::new(provider, registry, event_tx, cancel)
+            .with_user_edits(vec![edit.clone()]);
+
+        // Prior messages from a hypothetical previous session
+        let prior_user = AgentMessage::user("prior user message");
+        let prior_asst = AgentMessage::assistant(vec![ContentBlock::text("prior assistant")]);
+        let prior_messages = vec![prior_user, prior_asst];
+
+        let new_user = AgentMessage::user("new user message");
+        let messages = agent.run_continue(prior_messages, new_user).await.unwrap();
+
+        // 2 prior + 1 new user + 1 new assistant = 4
+        assert_eq!(messages.len(), 4);
+
+        // Collect events: there must be exactly 1 ContextEdited event
+        // re-emitted for the loaded edit.
+        let mut context_edited_count = 0;
+        while let Ok(envelope) = event_rx.try_recv() {
+            if let AgentEvent::ContextEdited { edit: evt_edit } = &envelope.event {
+                context_edited_count += 1;
+                assert!(
+                    evt_edit.exclude.contains(&0),
+                    "re-emitted edit must match the original"
+                );
+            }
+        }
+        assert_eq!(
+            context_edited_count, 1,
+            "run_continue must re-emit exactly one ContextEdited event per loaded edit"
+        );
     }
 }

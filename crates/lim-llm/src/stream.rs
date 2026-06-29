@@ -17,10 +17,16 @@ pub enum StreamEvent {
     /// Incremental thinking/reasoning content.
     ThinkingDelta { text: String },
 
-    /// A new tool call is starting (provides the tool call ID and name).
+    /// A new tool call is starting.
+    ///
+    /// `name` may be `None` if the provider hasn't sent the function name yet
+    /// (e.g. OpenAI Chat Completions sometimes sends `id` and `name` in the
+    /// same delta, but some compatible providers split them). The accumulator
+    /// will accept a second `ToolCallStart` with the same `id` to fill in the
+    /// name if it was initially `None`.
     ToolCallStart {
         id: ToolCallId,
-        name: String,
+        name: Option<String>,
     },
 
     /// Incremental JSON argument fragment for an in-progress tool call.

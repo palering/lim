@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn tool_call_block() {
         let id = ToolCallId::new();
-        let block = ContentBlock::tool_call(id, "bash", serde_json::json!({"cmd": "ls"}));
+        let block = ContentBlock::tool_call(id.clone(), "bash", serde_json::json!({"cmd": "ls"}));
         assert!(block.is_tool_call());
         let (tid, name, args) = block.as_tool_call().unwrap();
         assert_eq!(*tid, id);

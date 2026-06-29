@@ -84,6 +84,7 @@ impl ContextWindowManager {
         &self,
         messages: &[AgentMessage],
         provider: &Arc<dyn Provider>,
+        model: &str,
     ) -> Result<CompactionResult> {
         let tokens_before = estimate_tokens(messages);
         let budget = self.available_budget();
@@ -123,7 +124,7 @@ impl ContextWindowManager {
         let summary_text = if old_text.is_empty() {
             String::new()
         } else {
-            self.summarize(&old_text, Arc::clone(provider)).await?
+            self.summarize(&old_text, Arc::clone(provider), model).await?
         };
 
         // Build the compacted message list
@@ -228,6 +229,7 @@ impl ContextWindowManager {
         &self,
         conversation_text: &str,
         provider: Arc<dyn Provider>,
+        model: &str,
     ) -> Result<String> {
         let summary_prompt = format!(
             "Summarize the following conversation history concisely. \
@@ -242,7 +244,7 @@ impl ContextWindowManager {
             tool_call_ids: vec![],
         };
 
-        let request = LlmRequest::new(vec![llm_msg]);
+        let request = LlmRequest::new(model, vec![llm_msg]);
         let stream = provider.stream(request);
         let events: Vec<_> = collect_stream(stream).await;
 
@@ -259,8 +261,8 @@ impl ContextWindowManager {
 
 /// Collect a BoxStream of results into a Vec.
 async fn collect_stream<'a>(
-    mut stream: futures::stream::BoxStream<'a, lim_core::error::Result<StreamEvent>>,
-) -> Vec<lim_core::error::Result<StreamEvent>> {
+    mut stream: futures::stream::BoxStream<'a, std::result::Result<StreamEvent, lim_llm::ProviderError>>,
+) -> Vec<std::result::Result<StreamEvent, lim_llm::ProviderError>> {
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event);
@@ -462,7 +464,7 @@ mod tests {
         ];
 
         let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let result = cwm.compact(&messages, &provider).await.unwrap();
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
 
         assert!(!result.was_compacted);
         assert_eq!(result.messages.len(), 2);
@@ -472,7 +474,7 @@ mod tests {
     async fn no_compaction_empty_messages() {
         let cwm = ContextWindowManager::new(ContextConfig::default());
         let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let result = cwm.compact(&[], &provider).await.unwrap();
+        let result = cwm.compact(&[], &provider, "test-model").await.unwrap();
 
         assert!(!result.was_compacted);
         assert_eq!(result.messages.len(), 0);
@@ -487,7 +489,7 @@ mod tests {
         });
         let messages = vec![AgentMessage::user("hi")];
         let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let result = cwm.compact(&messages, &provider).await.unwrap();
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
 
         assert!(!result.was_compacted);
         assert_eq!(result.messages.len(), 1);
@@ -519,7 +521,7 @@ mod tests {
                 "Summary of old conversation".to_string(),
             )]));
 
-        let result = cwm.compact(&messages, &provider).await.unwrap();
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
 
         assert!(result.was_compacted);
         // First message should be system
@@ -548,7 +550,7 @@ mod tests {
                 "Summary".to_string(),
             )]));
 
-        let result = cwm.compact(&messages, &provider).await.unwrap();
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
 
         assert!(result.was_compacted);
         // summary + 2 recent pairs (2 user + 2 assistant = 4 messages) = 5
@@ -584,7 +586,7 @@ mod tests {
         messages.push(AgentMessage::user("use the tool"));
         messages.push(AgentMessage::assistant(vec![
             ContentBlock::text("let me check"),
-            ContentBlock::tool_call(tc_id, "bash", serde_json::json!({"cmd": "ls"})),
+            ContentBlock::tool_call(tc_id.clone(), "bash", serde_json::json!({"cmd": "ls"})),
         ]));
         messages.push(AgentMessage::tool_result(tc_id, "file1.txt\nfile2.txt", false));
         messages.push(AgentMessage::assistant(vec![ContentBlock::text(
@@ -596,7 +598,7 @@ mod tests {
                 "Summary of old stuff".to_string(),
             )]));
 
-        let result = cwm.compact(&messages, &provider).await.unwrap();
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
 
         assert!(result.was_compacted);
         // The assistant(tool_call) + tool_result pair must not be split
@@ -638,7 +640,7 @@ mod tests {
                 "The user asked many questions and got many answers.".to_string(),
             )]));
 
-        let result = cwm.compact(&messages, &provider).await.unwrap();
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
 
         assert!(result.was_compacted);
         // Summary is the first message
@@ -685,7 +687,7 @@ mod tests {
                 "Brief summary".to_string(),
             )]));
 
-        let result = cwm.compact(&messages, &provider).await.unwrap();
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
 
         assert!(result.was_compacted);
         assert!(result.tokens_after < result.tokens_before);
@@ -709,7 +711,7 @@ mod tests {
         ];
 
         let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let result = cwm.compact(&messages, &provider).await.unwrap();
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
 
         // Can't compact: all messages are "recent" (fewer pairs than keep_recent_pairs)
         assert!(!result.was_compacted);
@@ -753,7 +755,7 @@ mod tests {
             AgentMessage::assistant(vec![ContentBlock::text("old a")]), // 2
             AgentMessage::user("use tool"),                // 3
             AgentMessage::assistant(vec![                 // 4
-                ContentBlock::tool_call(tc_id, "bash", serde_json::json!({})),
+                ContentBlock::tool_call(tc_id.clone(), "bash", serde_json::json!({})),
             ]),
             AgentMessage::tool_result(tc_id, "ok", false), // 5
             AgentMessage::assistant(vec![ContentBlock::text("done")]), // 6
@@ -780,7 +782,7 @@ mod tests {
             AgentMessage::assistant(vec![ContentBlock::text("old a")]), // 1
             AgentMessage::user("tool please"),             // 2
             AgentMessage::assistant(vec![                 // 3
-                ContentBlock::tool_call(tc_id, "bash", serde_json::json!({})),
+                ContentBlock::tool_call(tc_id.clone(), "bash", serde_json::json!({})),
             ]),
             AgentMessage::tool_result(tc_id, "ok", false), // 4
             AgentMessage::assistant(vec![ContentBlock::text("done")]), // 5
