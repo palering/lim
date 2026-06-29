@@ -14,7 +14,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         Some(Popup::Approval(pa)) => {
             // Center the popup
             let area = centered_rect(60, 40, frame.area());
-            render_approval(frame, area, pa.tool_name(), pa.arguments());
+            let args_str = serde_json::to_string_pretty(pa.arguments()).unwrap_or_default();
+            render_approval(frame, area, pa.tool_name(), &args_str);
         }
         None => {}
     }
@@ -41,6 +42,11 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("    /approve           Cycle approval mode (auto → smart → always)"),
         Line::from("    /model [name]      Show or set the model"),
         Line::from("    /tokens            Show token usage"),
+        Line::from("    /edit              Interactive context editor"),
+        Line::from("        /edit list     Show messages with indices"),
+        Line::from("        /edit exclude 1,3,5   Drop messages from LLM context"),
+        Line::from("        /edit replace 2:text Replace message 2's content"),
+        Line::from("        /edit clear    Reset all user edits"),
         Line::from("    /clear             Clear the display"),
         Line::from(""),
         Line::from(vec![

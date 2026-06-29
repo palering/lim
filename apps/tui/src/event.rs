@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use lim_core::event::{AgentEvent, EventEnvelope};
 
+use crate::approval::ApprovalRequest;
+
 /// Events consumed by the TUI main loop.
 #[derive(Debug)]
 pub enum TuiEvent {
@@ -26,6 +28,8 @@ pub enum TuiEvent {
     Agent(AgentEvent),
     /// Terminal resized.
     Resize(u16, u16),
+    /// Tool approval request from the agent's before_tool_call hook.
+    Approval(ApprovalRequest),
 }
 
 impl TuiEvent {
@@ -121,6 +125,34 @@ pub fn spawn_agent_bridge(
                             continue;
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Spawn the approval bridge. Receives `ApprovalRequest`s from the agent's
+/// `before_tool_call` hook and forwards them as `TuiEvent::Approval` so the
+/// TUI can render a popup and collect the user's decision.
+pub fn spawn_approval_bridge(
+    mut approval_rx: mpsc::Receiver<ApprovalRequest>,
+    tui_tx: mpsc::UnboundedSender<TuiEvent>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+
+                maybe_request = approval_rx.recv() => {
+                    match maybe_request {
+                        Some(request) => {
+                            if tui_tx.send(TuiEvent::Approval(request)).is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
                     }
                 }
             }

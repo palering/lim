@@ -319,8 +319,8 @@ impl AnthropicStreamState {
             "message_delta" => {
                 // stop_reason + output_tokens usage
                 let mut events = Vec::new();
-                if let Some(delta) = payload.get("delta") {
-                    if let Some(stop) = delta.get("stop_reason").and_then(|v| v.as_str()) {
+                if let Some(delta) = payload.get("delta")
+                    && let Some(stop) = delta.get("stop_reason").and_then(|v| v.as_str()) {
                         let reason = match stop {
                             "tool_use" => StopReason::ToolCall,
                             "max_tokens" => StopReason::MaxTokens,
@@ -328,7 +328,6 @@ impl AnthropicStreamState {
                         };
                         events.push(StreamEvent::Done { stop_reason: reason });
                     }
-                }
                 if let Some(usage) = payload.get("usage") {
                     let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     events.push(StreamEvent::Usage(Usage::new(0, output)));

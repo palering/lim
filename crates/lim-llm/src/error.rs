@@ -6,7 +6,7 @@
 use thiserror::Error;
 
 /// Errors returned by LLM providers.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ProviderError {
     /// Network or transport-level error (timeout, connection refused, etc.).
     #[error("transport error: {0}")]

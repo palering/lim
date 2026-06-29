@@ -28,14 +28,15 @@
 //! 3. **Render loop** — redraws the screen at ~60fps (or on event).
 
 mod app;
+mod approval;
 mod event;
 mod terminal;
 mod ui;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use lim_agent::agent_loop::{AgentConfig, AgentLoop};
@@ -43,7 +44,8 @@ use lim_agent::registry::ToolRegistry;
 use lim_llm::providers::config::LimConfig;
 use lim_llm::Provider;
 
-pub use app::{App, ApprovalMode};
+pub use app::App;
+pub use approval::{ApprovalHooks, ApprovalMode, ApprovalRequest, ApprovalResponse};
 pub use event::TuiEvent;
 
 /// Configuration for the TUI session.
@@ -78,9 +80,26 @@ pub async fn run(config: TuiConfig) -> Result<()> {
         ..AgentConfig::default()
     };
 
-    let agent = AgentLoop::new(provider, registry, event_tx.clone(), cancel.clone())
-        .with_config(agent_config);
+    // Set up approval channel: ApprovalHooks sends ApprovalRequest to the TUI,
+    // TUI responds via an embedded oneshot sender.
+    let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+    let shared_mode = Arc::new(Mutex::new(ApprovalMode::Smart));
+    let hooks = Arc::new(ApprovalHooks::new(approval_tx, shared_mode.clone()));
 
-    let mut app = App::new(agent, provider_label, model, lim_config, event_tx, cancel);
+    let agent = AgentLoop::new(provider, registry, event_tx.clone(), cancel.clone())
+        .with_config(agent_config)
+        .with_hooks(hooks.clone());
+
+    let mut app = App::new(
+        agent,
+        provider_label,
+        model,
+        lim_config,
+        event_tx,
+        cancel,
+        approval_rx,
+        shared_mode,
+        hooks,
+    );
     app.run().await
 }
