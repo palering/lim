@@ -58,7 +58,17 @@ impl StreamAccumulator {
                 None // thinking deltas don't produce visible MessageUpdate events
             }
             StreamEvent::ToolCallStart { id, name } => {
-                self.tool_calls.push((id, name, String::new()));
+                // If we already have an entry for this id (e.g. name filled in later),
+                // update the name instead of creating a duplicate.
+                if let Some(entry) = self.tool_calls.iter_mut().find(|(tid, _, _)| *tid == id) {
+                    if entry.1.is_empty() {
+                        if let Some(n) = name {
+                            entry.1 = n;
+                        }
+                    }
+                } else {
+                    self.tool_calls.push((id, name.unwrap_or_default(), String::new()));
+                }
                 None
             }
             StreamEvent::ToolCallDelta {
@@ -172,11 +182,11 @@ mod tests {
             text: "Let me check".to_string(),
         });
         acc.ingest(StreamEvent::ToolCallStart {
-            id: tc_id,
-            name: "bash".to_string(),
+            id: tc_id.clone(),
+            name: Some("bash".to_string()),
         });
         acc.ingest(StreamEvent::ToolCallDelta {
-            id: tc_id,
+            id: tc_id.clone(),
             arguments_delta: "{\"cmd\":\"ls\"}".to_string(),
         });
         acc.ingest(StreamEvent::Done {

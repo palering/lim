@@ -1,15 +1,21 @@
 use futures::stream::BoxStream;
 
-use lim_core::error::Result;
 use lim_core::message::LlmMessage;
 use lim_core::tool::ToolSchema;
 
+use crate::error::ProviderError;
 use crate::model::ModelMetadata;
 use crate::stream::StreamEvent;
 
 /// Parameters for an LLM request.
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
+    /// Model name to request (e.g. "gpt-4o", "claude-sonnet-4-20250514").
+    ///
+    /// The provider does NOT hold a model — each request specifies which model
+    /// to call. This allows a single provider instance (e.g. an OpenRouter
+    /// endpoint) to serve multiple models.
+    pub model: String,
     /// Linearized messages for the model.
     pub messages: Vec<LlmMessage>,
     /// Available tools the model can call.
@@ -21,9 +27,10 @@ pub struct LlmRequest {
 }
 
 impl LlmRequest {
-    /// Create a minimal request with just messages.
-    pub fn new(messages: Vec<LlmMessage>) -> Self {
+    /// Create a minimal request with just model and messages.
+    pub fn new(model: impl Into<String>, messages: Vec<LlmMessage>) -> Self {
         Self {
+            model: model.into(),
             messages,
             tools: Vec::new(),
             system: None,
@@ -42,6 +49,12 @@ impl LlmRequest {
         self.system = Some(system.into());
         self
     }
+
+    /// Set max output tokens.
+    pub fn with_max_tokens(mut self, max_tokens: u64) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
 }
 
 /// Trait for LLM providers.
@@ -56,8 +69,12 @@ pub trait Provider: Send + Sync {
     fn stream<'a>(
         &'a self,
         request: LlmRequest,
-    ) -> BoxStream<'a, Result<StreamEvent>>;
+    ) -> BoxStream<'a, Result<StreamEvent, ProviderError>>;
 
-    /// Return metadata about the model this provider serves.
-    fn model_metadata(&self) -> ModelMetadata;
+    /// Return metadata about a specific model served by this provider.
+    ///
+    /// `model` is the model name from [`LlmRequest::model`]. This allows a
+    /// single provider (e.g. OpenRouter) to report different context windows
+    /// for different models it serves.
+    fn model_metadata(&self, model: &str) -> ModelMetadata;
 }

@@ -100,7 +100,7 @@ impl AgentMessage {
                     arguments,
                 } = block
                 {
-                    Some((*id, name.as_str(), arguments))
+                    Some((id.clone(), name.as_str(), arguments))
                 } else {
                     None
                 }
@@ -181,7 +181,7 @@ mod tests {
         let tc_id = ToolCallId::new();
         let msg = AgentMessage::assistant(vec![
             ContentBlock::text("Let me check"),
-            ContentBlock::tool_call(tc_id, "bash", serde_json::json!({"cmd": "ls"})),
+            ContentBlock::tool_call(tc_id.clone(), "bash", serde_json::json!({"cmd": "ls"})),
         ]);
         assert!(msg.has_tool_calls());
         let calls = msg.tool_calls();

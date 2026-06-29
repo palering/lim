@@ -1,3 +1,4 @@
+use lim_core::context_edit::ContextEdit;
 use lim_core::event::{AgentEvent, EventEnvelope};
 use lim_core::message::AgentMessage;
 
@@ -12,6 +13,26 @@ pub fn replay_transcript(events: &[EventEnvelope]) -> Vec<AgentMessage> {
         .filter_map(|envelope| {
             if let AgentEvent::MessageEnd { message, .. } = &envelope.event {
                 Some(message.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Replay all `ContextEdited` events in order, returning the composed set of
+/// user edits that should be re-applied on session resume.
+///
+/// Each `ContextEdited` event carries a `ContextEdit` descriptor. We compose
+/// them in arrival order (later edits append/override earlier ones) so that
+/// `AgentLoop::with_user_edits(replay_edits(&events))` faithfully reproduces
+/// the user's manual context edits from the prior session.
+pub fn replay_edits(events: &[EventEnvelope]) -> Vec<ContextEdit> {
+    events
+        .iter()
+        .filter_map(|envelope| {
+            if let AgentEvent::ContextEdited { edit } = &envelope.event {
+                Some(edit.clone())
             } else {
                 None
             }
@@ -107,7 +128,7 @@ mod tests {
         let tc_id = ToolCallId::new();
         let user_msg = AgentMessage::user("read the file");
         let assistant_msg = AgentMessage::assistant(vec![ContentBlock::tool_call(
-            tc_id,
+            tc_id.clone(),
             "read",
             serde_json::json!({"path": "test.txt"}),
         )]);
@@ -161,5 +182,79 @@ mod tests {
 
         let transcript = replay_transcript(&events);
         assert!(transcript.is_empty());
+    }
+
+    #[test]
+    fn replay_edits_extracts_context_edited_events() {
+        use lim_core::context_edit::ContextEdit;
+        use std::collections::HashSet;
+
+        let edit1 = ContextEdit {
+            exclude: HashSet::from([0, 1]),
+            ..Default::default()
+        };
+        let edit2 = ContextEdit {
+            exclude: HashSet::from([5]),
+            ..Default::default()
+        };
+
+        let events = vec![
+            EventEnvelope::new(
+                0,
+                SessionId::new(),
+                BranchId::new(),
+                TraceId::new(),
+                AgentEvent::AgentStart,
+            ),
+            EventEnvelope::new(
+                1,
+                SessionId::new(),
+                BranchId::new(),
+                TraceId::new(),
+                AgentEvent::ContextEdited { edit: edit1 },
+            ),
+            EventEnvelope::new(
+                2,
+                SessionId::new(),
+                BranchId::new(),
+                TraceId::new(),
+                AgentEvent::AgentEnd,
+            ),
+            EventEnvelope::new(
+                3,
+                SessionId::new(),
+                BranchId::new(),
+                TraceId::new(),
+                AgentEvent::ContextEdited { edit: edit2 },
+            ),
+        ];
+
+        let edits = replay_edits(&events);
+        assert_eq!(edits.len(), 2);
+        assert!(edits[0].exclude.contains(&0));
+        assert!(edits[0].exclude.contains(&1));
+        assert!(edits[1].exclude.contains(&5));
+    }
+
+    #[test]
+    fn replay_edits_empty_when_no_edits() {
+        let events = vec![
+            EventEnvelope::new(
+                0,
+                SessionId::new(),
+                BranchId::new(),
+                TraceId::new(),
+                AgentEvent::AgentStart,
+            ),
+            EventEnvelope::new(
+                1,
+                SessionId::new(),
+                BranchId::new(),
+                TraceId::new(),
+                AgentEvent::AgentEnd,
+            ),
+        ];
+        let edits = replay_edits(&events);
+        assert!(edits.is_empty());
     }
 }

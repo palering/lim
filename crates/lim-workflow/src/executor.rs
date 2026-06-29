@@ -232,6 +232,7 @@ impl WorkflowExecutor {
         let config = AgentConfig {
             max_turns: 10,
             system_prompt: Some(system_prompt.to_string()),
+            model: String::new(),
         };
 
         let mut agent = AgentLoop::new(provider, registry, event_tx, cancel)
@@ -408,6 +409,7 @@ impl WorkflowExecutor {
         let config = AgentConfig {
             max_turns: 1,
             system_prompt: Some(system_prompt.to_string()),
+            model: String::new(),
         };
 
         let mut agent = AgentLoop::new(provider, registry, event_tx, cancel)
