@@ -90,6 +90,24 @@ pub enum AgentEvent {
     ContextEdited {
         edit: crate::context_edit::ContextEdit,
     },
+
+    /// A recoverable error occurred during the agent loop.
+    ///
+    /// Emitted when a provider stream error is classified as retryable
+    /// (rate limit, transport, server overload) and the agent is about to
+    /// retry the request, OR when retries are exhausted and the turn is
+    /// about to fail. Persisted to the session JSONL so error history is
+    /// preserved across resumes.
+    Error {
+        /// Human-readable error message.
+        message: String,
+        /// Whether the agent loop considers this error retryable.
+        retryable: bool,
+        /// Retry attempt number (1-based). 0 means no retry attempted.
+        retry_count: u32,
+        /// Max retries the agent loop will attempt before giving up.
+        max_retries: u32,
+    },
 }
 
 /// Envelope wrapping every event with correlation IDs.

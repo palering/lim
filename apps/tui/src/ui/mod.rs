@@ -1,6 +1,6 @@
 //! UI layout and rendering.
 //!
-//! The screen is divided into three vertical regions:
+//! The screen is divided into vertical regions:
 //!
 //! ```text
 //! ┌───────────────────┐
@@ -13,7 +13,7 @@
 //! ├───────────────────┤
 //! │ Input (3 rows)    │  multi-line editor
 //! ├───────────────────┤
-//! │ Status (1 row)    │  tokens, turn, mode, busy indicator
+//! │ Status (2 rows)  │  line 1: busy/turn/mode  line 2: tokens/ctx usage
 //! └───────────────────┘
 //! ```
 
@@ -39,7 +39,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(1),    // header
             Constraint::Min(10),      // messages (flexible)
             Constraint::Length(4),    // input (3 lines + border)
-            Constraint::Length(1),    // status bar
+            Constraint::Length(2),    // status bar (2 rows)
         ])
         .split(area);
 

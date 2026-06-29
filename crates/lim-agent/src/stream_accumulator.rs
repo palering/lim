@@ -43,6 +43,20 @@ impl StreamAccumulator {
         *self.message_id.get_or_insert_with(lim_core::MessageId::new)
     }
 
+    /// Reset content state while preserving the message ID.
+    ///
+    /// Used when retrying a stream after a retryable error: the accumulator
+    /// keeps its assigned `message_id` (so the TUI's streaming view stays
+    /// stable), but discards any partial content accumulated from the failed
+    /// attempt.
+    pub fn reset(&mut self) {
+        self.text.clear();
+        self.thinking.clear();
+        self.tool_calls.clear();
+        self.usage = None;
+        self.stop_reason = None;
+    }
+
     /// Process a single stream event, returning the delta string for event emission.
     ///
     /// Returns `Some(delta_text)` if this event produced visible content,
@@ -61,11 +75,10 @@ impl StreamAccumulator {
                 // If we already have an entry for this id (e.g. name filled in later),
                 // update the name instead of creating a duplicate.
                 if let Some(entry) = self.tool_calls.iter_mut().find(|(tid, _, _)| *tid == id) {
-                    if entry.1.is_empty() {
-                        if let Some(n) = name {
+                    if entry.1.is_empty()
+                        && let Some(n) = name {
                             entry.1 = n;
                         }
-                    }
                 } else {
                     self.tool_calls.push((id, name.unwrap_or_default(), String::new()));
                 }

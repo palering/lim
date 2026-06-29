@@ -1,7 +1,7 @@
 # lim — Implementation Progress
 
-> Last updated: 2026-06-28
-> Workspace: 10 crates, ~12900 lines Rust, 188 tests, 0 clippy warnings
+> Last updated: 2026-06-30
+> Workspace: 10 crates, 198 tests, 0 clippy warnings
 > Details: [docs/archive/completed-phases.md](docs/archive/completed-phases.md)
 
 ## Completed
@@ -95,25 +95,45 @@ Critical fixes verified against real LLM endpoints:
 - The 4 grok failures are model-capability issues, not lim bugs (verified: same `tool` schema works on anthropic-type)
 - 188 unit tests + 9 e2e runs cover the implementation
 
+### Phase 3b: UX Hardening — DONE
+
+4 work streams closing out Phase 3. +10 tests (188→198), 0 clippy warnings.
+
+**Approval (真阻塞) — `apps/tui/src/approval.rs`**
+
+- `ApprovalMode::{Auto, Smart, Always}` shared via `Arc<Mutex<ApprovalMode>>` between `ApprovalHooks` and `App`
+- `ApprovalRequest` carries a `oneshot::Sender<ApprovalResponse>`; `ApprovalHooks::before_tool_call` blocks on `rx.await` until TUI responds
+- Smart mode auto-approves read-only tools, prompts for write/exec
+- 11 unit tests cover auto/smart/always modes, deny, closed channel, idempotent respond
+- `run_continue` re-emits `ContextEdited` events so chained resumes preserve edit history
+
+**Cost / Usage Panel — `apps/tui/src/ui/status.rs`**
+
+- Status bar expanded to 2 rows
+- Line 1: busy indicator · turn count · approval mode · status message
+- Line 2: cumulative tokens · last turn tokens · context window usage (`msgs→msgs (tok→tok)` shown only after first compaction)
+- `ContextWindowUsage` cached on `App` from `AgentEvent::ContextCompacted`
+
+**Context Editing — CLI + TUI**
+
+- `lim edit-context --session <jsonl> [--exclude 1,3,5] [--replace 2:...] [--list]` appends a `ContextEdited` event to the JSONL (uses `OpenOptions::append(true)`, not `SessionWriter` which truncates)
+- TUI `/edit list|exclude|replace|clear` sends `AgentCommand::{ApplyEdit, ClearEdits}` to the agent task
+- `AgentLoop::apply_user_edit` / `clear_user_edits` emit `ContextEdited` events for persistence
+- `clear_user_edits` is a no-op when the edit list is empty (no event emitted)
+- 3 unit tests cover apply / clear-emits-empty / clear-noop-when-empty
+
+**Error Recovery — `crates/lim-agent/src/agent_loop.rs`**
+
+- `AgentEvent::Error { message, retryable, retry_count, max_retries }` variant added
+- Retry loop: only retry when no content has been emitted yet (avoids duplicate/partial messages)
+- Exponential backoff: 1s → 2s → 4s, `MAX_RETRIES = 3`
+- Cancellation-aware sleep via `tokio::select!`
+- `StreamAccumulator::reset()` clears content but preserves `message_id` for stable TUI rendering
+- `MockResponse::Error(ProviderError)` supports deterministic retry tests; `ProviderError` now derives `Clone`
+- 3 unit tests cover retry-success / no-retry-on-auth / retry-exhaustion (use `#[tokio::test(start_paused = true)]` for instant backoff)
+- TUI shows `⚠ <msg>  (retry N/M)` during retries, `⚠ <msg>  (retries exhausted: N/M)` on final failure
+
 ## Planned
-
-### Phase 3 Remaining: UX Hardening
-
-Goal: Approval, observability, and interactive editing.
-
-- Approval UI — interactive tool approval, cancellation, steering interaction (basic popup exists; needs full keyboard flow)
-- Cost/usage panel — real-time token tracking and budget enforcement
-- CLI `edit-context` subcommand and TUI interactive context editing
-- Robustness: error recovery, retries, partial-stream failures
-
-Acceptance (updated):
-
-- [x] Long session triggers summary compaction without losing original events
-- [x] ContextEdit composes through 3-layer pipeline without mutating original history
-- [x] TUI renders streaming output without blocking agent loop
-- [x] Session resume replays ContextEdited events across chained resumes
-- [ ] Tool approval, cancellation, and steering are fully interactive
-- [ ] Real-time token usage visible to user
 
 ### Phase 4: Strong Isolation & External Tools
 
@@ -134,14 +154,14 @@ Acceptance:
 
 | Crate | Layer | Phase | Tests |
 | :--- | :--- | :--- | :--- |
-| lim-core | Foundation | 1+3 | 30 |
+| lim-core | Foundation | 1+3 | 33 |
 | lim-llm | Foundation | 1+3 | 61 |
-| lim-agent | Core | 1+3 | 28 |
+| lim-agent | Core | 1+3 | 35 |
 | lim-executor | Core | 1 | 6 |
 | lim-tools | Core | 1 | 0 |
 | lim-session | Core | 1+3 | 11 |
 | lim-workflow | Orchestration | 2 | 22 |
 | lim (apps/cli) | Entry | 1+3 | 0 |
-| lim-tui (apps/tui) | Frontend | 3 | 0 |
+| lim-tui (apps/tui) | Frontend | 3 | 11 |
 | novel-pack (packs/novel) | Domain | 2 | 15 |
-| **Total** | | | **188** |
+| **Total** | | | **194** (+4 integration) = **198** |

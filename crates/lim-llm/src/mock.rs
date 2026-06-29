@@ -24,6 +24,10 @@ pub enum MockResponse {
         /// Tool calls to emit.
         calls: Vec<MockToolCall>,
     },
+
+    /// Stream an error back to the consumer. Used for testing retry logic
+    /// in the agent loop (e.g. `MockResponse::Error(ProviderError::RateLimited { .. })`).
+    Error(ProviderError),
 }
 
 /// A tool call in a mock response.
@@ -120,6 +124,9 @@ impl Provider for MockProvider {
                 }));
 
                 stream::iter(events).boxed()
+            }
+            Some(MockResponse::Error(err)) => {
+                stream::once(async move { Err(err) }).boxed()
             }
         }
     }

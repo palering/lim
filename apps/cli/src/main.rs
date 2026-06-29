@@ -3,12 +3,16 @@ use std::sync::Arc;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use lim_agent::agent_loop::{AgentConfig, AgentLoop};
 use lim_agent::registry::ToolRegistry;
+use lim_core::content::ContentBlock;
+use lim_core::context_edit::ContextEdit;
 use lim_core::error::Result;
+use lim_core::event::{AgentEvent, EventEnvelope};
 use lim_core::message::AgentMessage;
 use lim_executor::local::LocalExecutor;
 use lim_llm::mock::{MockProvider, MockResponse, MockToolCall};
@@ -85,6 +89,32 @@ enum Commands {
 
     /// List configured providers from `.lim/config.toml`.
     Providers,
+
+    /// Edit the context of a saved session (appends a `ContextEdited` event).
+    ///
+    /// Reads the session JSONL, applies the requested edits, and appends a
+    /// single `ContextEdited` event describing the modification. The next
+    /// `lim run --resume <session>` will pick up the edit via `replay_edits`.
+    EditContext {
+        /// Path to the session JSONL file.
+        #[arg(long)]
+        session: Utf8PathBuf,
+
+        /// Comma-separated message indices to exclude from future LLM calls.
+        /// e.g. `--exclude 1,3,5`
+        #[arg(long)]
+        exclude: Option<String>,
+
+        /// Replace a message's text content: `INDEX:NEW_TEXT`.
+        /// Can be specified multiple times.
+        /// e.g. `--replace 2:[summarized]`
+        #[arg(long = "replace")]
+        replace: Vec<String>,
+
+        /// List messages with indices (no edit applied).
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 /// Fixture format for MockProvider scripted responses.
@@ -166,6 +196,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Providers => {
             list_providers();
+        }
+        Commands::EditContext {
+            session,
+            exclude,
+            replace,
+            list,
+        } => {
+            edit_context(session, exclude, replace, list).await?;
         }
     }
 
@@ -516,6 +554,170 @@ async fn run_tui(
     let _ = logger_handle.await;
 
     eprintln!("Session log: {session_path}");
+
+    Ok(())
+}
+
+/// `lim edit-context` — append a `ContextEdited` event to a saved session.
+///
+/// Reads the session JSONL to recover (session_id, branch_id, trace_id, seq),
+/// builds a `ContextEdit` from `--exclude` / `--replace` flags, and appends a
+/// single `EventEnvelope { event: AgentEvent::ContextEdited, .. }` line.
+/// The next `lim run --resume <session>` will pick up the edit via
+/// `replay_edits`.
+///
+/// `--list` short-circuits and prints the messages with indices instead of
+/// writing an event.
+async fn edit_context(
+    session: Utf8PathBuf,
+    exclude: Option<String>,
+    replace: Vec<String>,
+    list: bool,
+) -> Result<()> {
+    let events = lim_session::reader::SessionReader::read_all(&session).await?;
+    if events.is_empty() {
+        eprintln!("Session file `{session}` is empty or does not exist");
+        return Ok(());
+    }
+
+    let messages = replay_transcript(&events);
+
+    // Always print the message index map — useful with or without --list.
+    println!("Session: {session}");
+    println!("Messages: {}", messages.len());
+    println!("Events:   {}", events.len());
+    if !messages.is_empty() {
+        println!();
+        println!("{:<6} {:<6} PREVIEW", "IDX", "ROLE");
+        for (i, msg) in messages.iter().enumerate() {
+            let role = match msg.role {
+                lim_core::message::Role::User => "user",
+                lim_core::message::Role::Assistant => "asst",
+                lim_core::message::Role::Tool => "tool",
+                lim_core::message::Role::System => "sys",
+            };
+            let preview: String = msg
+                .content
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let preview = if preview.len() > 60 {
+                format!("{}...", &preview[..57])
+            } else {
+                preview
+            };
+            println!("{i:<6} {role:<6} {preview}");
+        }
+    }
+
+    if list {
+        return Ok(());
+    }
+
+    // Build the edit from CLI flags.
+    let mut edit = ContextEdit::none();
+
+    if let Some(exclude_str) = exclude {
+        let indices: Vec<usize> = exclude_str
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+        for idx in &indices {
+            edit = edit.exclude(*idx);
+        }
+        if !indices.is_empty() {
+            println!("\nExcluding indices: {:?}", indices);
+        }
+    }
+
+    for spec in &replace {
+        // Format: "INDEX:NEW_TEXT"
+        match spec.split_once(':') {
+            Some((idx_str, text)) => {
+                let idx: usize = match idx_str.trim().parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!("Invalid index in --replace `{spec}` (expected `INDEX:TEXT`)");
+                        continue;
+                    }
+                };
+                let text = text.trim();
+                if text.is_empty() {
+                    eprintln!("Empty replacement text in --replace `{spec}`");
+                    continue;
+                }
+                edit = edit.replace(idx, vec![ContentBlock::text(text)]);
+                println!("Replacing message {idx}'s content with: {text}");
+            }
+            None => {
+                eprintln!("Malformed --replace `{spec}` (expected `INDEX:TEXT`)");
+            }
+        }
+    }
+
+    if edit.is_empty() {
+        println!("\nNo edits specified. Use --exclude or --replace, or --list to just view.");
+        return Ok(());
+    }
+
+    if !edit.validate(messages.len()) {
+        eprintln!(
+            "\nERROR: edit contains out-of-bounds indices (message count = {}).",
+            messages.len()
+        );
+        eprintln!("Valid indices: 0..{}", messages.len().saturating_sub(1));
+        return Err(lim_core::error::LimError::ToolExecution {
+            name: "edit_context".to_string(),
+            message: "edit validation failed: out-of-bounds indices".to_string(),
+        });
+    }
+
+    // Recover correlation IDs from the last event in the file.
+    let last = events.last().unwrap();
+    let next_seq = last.seq + 1;
+    let session_id = last.session_id;
+    let branch_id = last.branch_id;
+    let trace_id = last.trace_id;
+
+    let envelope = EventEnvelope::new(
+        next_seq,
+        session_id,
+        branch_id,
+        trace_id,
+        AgentEvent::ContextEdited { edit: edit.clone() },
+    );
+
+    let line = serde_json::to_string(&envelope).map_err(|e| {
+        lim_core::error::LimError::ToolExecution {
+            name: "edit_context".to_string(),
+            message: format!("failed to serialize event: {e}"),
+        }
+    })?;
+
+    // Append to the session file. We intentionally do NOT use SessionWriter
+    // here because it truncates on open — that would wipe the prior session.
+    // Appending a single line is the correct behavior for adding a new event
+    // to an existing log.
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(false)
+        .append(true)
+        .open(session.as_std_path())
+        .await
+        .map_err(|e| lim_core::error::LimError::SessionIo(format!(
+            "failed to open session file for append: {e}"
+        )))?;
+    file.write_all((line + "\n").as_bytes()).await.map_err(|e| {
+        lim_core::error::LimError::SessionIo(format!("failed to append edit: {e}"))
+    })?;
+    file.flush().await.map_err(|e| {
+        lim_core::error::LimError::SessionIo(format!("failed to flush edit: {e}"))
+    })?;
+
+    println!("\nAppended ContextEdited event (seq {next_seq}) to {session}");
+    println!("Next `lim run --resume {session}` will apply this edit.");
 
     Ok(())
 }

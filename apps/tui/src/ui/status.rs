@@ -1,4 +1,7 @@
-//! Status bar — shows tokens, turns, approval mode, busy indicator.
+//! Status bar — 2-row panel showing operational state and cost/usage.
+//!
+//! Line 1: busy indicator · turn count · approval mode · status message
+//! Line 2: total tokens · current turn tokens · context window usage
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -9,54 +12,85 @@ use ratatui::Frame;
 use crate::app::App;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans: Vec<Span> = Vec::new();
+    // ── Line 1: operational state ──
+    let mut line1: Vec<Span> = Vec::new();
 
-    // Busy indicator
     if app.agent_busy() {
-        spans.push(Span::styled(
+        line1.push(Span::styled(
             " ⟳ working ",
             Style::default().fg(Color::Yellow),
         ));
     } else {
-        spans.push(Span::styled(" ● ready ", Style::default().fg(Color::Green)));
+        line1.push(Span::styled(
+            " ● ready ",
+            Style::default().fg(Color::Green),
+        ));
     }
 
-    // Turn count
-    spans.push(Span::raw(" · "));
-    spans.push(Span::styled(
+    line1.push(Span::raw("· "));
+    line1.push(Span::styled(
         format!("turn {}", app.turn_count()),
         Style::default().fg(Color::Cyan),
     ));
 
-    // Token usage
-    spans.push(Span::raw(" · "));
-    spans.push(Span::styled(
+    line1.push(Span::raw("  ·  "));
+    line1.push(Span::styled(
+        format!("approve: {}", app.approval_mode().label()),
+        Style::default().fg(Color::Blue),
+    ));
+
+    if let Some(msg) = app.status_msg() {
+        line1.push(Span::raw("  "));
+        line1.push(Span::styled(msg, Style::default().fg(Color::DarkGray)));
+    }
+
+    // ── Line 2: cost / usage ──
+    let mut line2: Vec<Span> = Vec::new();
+
+    // Total tokens (cumulative across all turns)
+    line2.push(Span::styled(
+        "total ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    line2.push(Span::styled(
         format!(
-            "{}↑ {}↓ tokens",
+            "{}↑ {}↓",
             format_tokens(app.total_input_tokens()),
             format_tokens(app.total_output_tokens())
         ),
         Style::default().fg(Color::Magenta),
     ));
 
-    // Approval mode
-    spans.push(Span::raw(" · "));
-    spans.push(Span::styled(
-        format!("approve: {}", app.approval_mode().label()),
-        Style::default().fg(Color::Blue),
+    // Current turn tokens (last TurnEnd's usage)
+    line2.push(Span::raw("  ·  "));
+    line2.push(Span::styled("turn ", Style::default().fg(Color::DarkGray)));
+    line2.push(Span::styled(
+        format!(
+            "{}↑ {}↓",
+            format_tokens(app.current_turn_input()),
+            format_tokens(app.current_turn_output())
+        ),
+        Style::default().fg(Color::LightMagenta),
     ));
 
-    // Status message (if any, show on the right)
-    if let Some(msg) = app.status_msg() {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            msg,
-            Style::default().fg(Color::DarkGray),
+    // Context window usage (only shown if compaction has happened)
+    if let Some(usage) = app.context_window_usage() {
+        line2.push(Span::raw("  ·  "));
+        line2.push(Span::styled("ctx ", Style::default().fg(Color::DarkGray)));
+        line2.push(Span::styled(
+            format!(
+                "{}→{} msgs ({}→{} tok)",
+                usage.messages_before,
+                usage.messages_after,
+                format_tokens(usage.tokens_before),
+                format_tokens(usage.tokens_after),
+            ),
+            Style::default().fg(Color::Yellow),
         ));
     }
 
-    let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Black));
+    let lines = vec![Line::from(line1), Line::from(line2)];
+    let paragraph = Paragraph::new(lines).style(Style::default().bg(Color::Black));
     frame.render_widget(paragraph, area);
 }
 

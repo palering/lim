@@ -5,7 +5,7 @@
 //! background tokio task; events flow back via the broadcast channel.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -14,55 +14,15 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use lim_agent::agent_loop::AgentLoop;
+use lim_core::context_edit::ContextEdit;
 use lim_core::event::AgentEvent;
 use lim_core::id::{MessageId, ToolCallId};
 use lim_core::message::AgentMessage;
 
-use crate::event::{TuiEvent, spawn_agent_bridge, spawn_input_poller};
+use crate::approval::{ApprovalHooks, ApprovalMode, ApprovalRequest, ApprovalResponse};
+use crate::event::{TuiEvent, spawn_agent_bridge, spawn_approval_bridge, spawn_input_poller};
 use crate::terminal::TerminalGuard;
 use crate::ui;
-
-/// Tool approval mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalMode {
-    /// Auto-approve all tools (no prompts).
-    Auto,
-    /// Approve read-only tools (read, glob, grep); prompt for write/exec tools.
-    Smart,
-    /// Prompt for every tool call.
-    Always,
-}
-
-impl ApprovalMode {
-    pub fn next(self) -> Self {
-        match self {
-            ApprovalMode::Auto => ApprovalMode::Smart,
-            ApprovalMode::Smart => ApprovalMode::Always,
-            ApprovalMode::Always => ApprovalMode::Auto,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ApprovalMode::Auto => "auto",
-            ApprovalMode::Smart => "smart",
-            ApprovalMode::Always => "always",
-        }
-    }
-
-    /// Whether a given tool name requires approval under this mode.
-    pub fn requires_approval(self, tool_name: &str) -> bool {
-        match self {
-            ApprovalMode::Auto => false,
-            ApprovalMode::Always => true,
-            ApprovalMode::Smart => {
-                // Read-only tools that never modify state.
-                const SAFE_TOOLS: &[&str] = &["read", "glob", "grep", "ls"];
-                !SAFE_TOOLS.contains(&tool_name)
-            }
-        }
-    }
-}
 
 /// Display info for a tool call in progress or completed.
 #[derive(Debug, Clone)]
@@ -90,24 +50,6 @@ pub struct StreamingMessage {
     pub thinking: String,
 }
 
-/// Pending approval request (when a tool needs user confirmation).
-#[derive(Debug, Clone)]
-pub struct PendingApproval {
-    pub tool_call_id: ToolCallId,
-    pub tool_name: String,
-    pub arguments: String,
-}
-
-impl PendingApproval {
-    pub fn tool_name(&self) -> &str {
-        &self.tool_name
-    }
-
-    pub fn arguments(&self) -> &str {
-        &self.arguments
-    }
-}
-
 /// Command sent to the agent task.
 enum AgentCommand {
     /// Run a user message.
@@ -117,9 +59,12 @@ enum AgentCommand {
     /// Replace the provider (applies to subsequent turns).
     SetProvider {
         provider: Arc<dyn lim_llm::Provider>,
-        label: String,
         model: String,
     },
+    /// Apply a persistent context edit (excludes/replaces messages for future LLM calls).
+    ApplyEdit(ContextEdit),
+    /// Clear all persistent user edits.
+    ClearEdits,
 }
 
 /// The TUI application.
@@ -136,6 +81,13 @@ pub struct App {
     // Event channels
     event_tx: broadcast::Sender<lim_core::event::EventEnvelope>,
     cancel: CancellationToken,
+
+    // Approval — shared with the agent's ApprovalHooks
+    shared_mode: Arc<Mutex<ApprovalMode>>,
+    hooks: Arc<ApprovalHooks>,
+    /// Receiver for approval requests from the agent hook.
+    /// Taken by `spawn_approval_bridge` when the main loop starts.
+    approval_rx: Option<mpsc::Receiver<ApprovalRequest>>,
 
     // Input state
     input: String,
@@ -155,7 +107,12 @@ pub struct App {
     // Statistics
     total_input_tokens: u64,
     total_output_tokens: u64,
+    current_turn_input: u64,
+    current_turn_output: u64,
     turn_count: usize,
+
+    // Context window usage (updated on ContextCompacted events)
+    context_window_usage: Option<ContextWindowUsage>,
 
     // Control
     running: bool,
@@ -167,9 +124,9 @@ pub struct App {
     // Expanded tool call IDs (for full output display)
     expanded_tools: HashSet<ToolCallId>,
 
-    // Mode
-    approval_mode: ApprovalMode,
-    pending_approval: Option<PendingApproval>,
+    // Pending approval request (when a tool needs user confirmation).
+    // The request carries a oneshot sender; calling `respond()` releases it.
+    pending_approval: Option<ApprovalRequest>,
 
     // Popup
     popup: Option<Popup>,
@@ -178,13 +135,25 @@ pub struct App {
     status_msg: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+/// Snapshot of context window usage, updated whenever compaction runs.
+#[derive(Debug, Clone, Default)]
+pub struct ContextWindowUsage {
+    pub messages_before: usize,
+    pub messages_after: usize,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    /// Whether the last compaction actually triggered compaction.
+    pub was_compacted: bool,
+}
+
+#[derive(Debug)]
 pub enum Popup {
     Help,
-    Approval(PendingApproval),
+    Approval(ApprovalRequest),
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent: AgentLoop,
         provider_label: String,
@@ -192,6 +161,9 @@ impl App {
         lim_config: lim_llm::providers::config::LimConfig,
         event_tx: broadcast::Sender<lim_core::event::EventEnvelope>,
         cancel: CancellationToken,
+        approval_rx: mpsc::Receiver<ApprovalRequest>,
+        shared_mode: Arc<Mutex<ApprovalMode>>,
+        hooks: Arc<ApprovalHooks>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
 
@@ -212,7 +184,7 @@ impl App {
                     AgentCommand::SetModel(new_model) => {
                         agent.set_model(new_model);
                     }
-                    AgentCommand::SetProvider { provider, label: _, model } => {
+                    AgentCommand::SetProvider { provider, model } => {
                         agent.set_provider(provider);
                         agent.set_model(model);
                     }
@@ -235,6 +207,16 @@ impl App {
                             };
                         }
                     }
+                    AgentCommand::ApplyEdit(edit) => {
+                        if let Err(e) = agent.apply_user_edit(edit) {
+                            tracing::error!("apply_user_edit error: {e}");
+                        }
+                    }
+                    AgentCommand::ClearEdits => {
+                        if let Err(e) = agent.clear_user_edits() {
+                            tracing::error!("clear_user_edits error: {e}");
+                        }
+                    }
                 }
             }
         });
@@ -245,7 +227,10 @@ impl App {
             lim_config,
             cmd_tx,
             event_tx,
-            cancel,
+            cancel: cancel.clone(),
+            shared_mode,
+            hooks,
+            approval_rx: Some(approval_rx),
             input: String::new(),
             input_cursor: 0,
             messages: Vec::new(),
@@ -254,12 +239,14 @@ impl App {
             tool_calls: HashMap::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            current_turn_input: 0,
+            current_turn_output: 0,
             turn_count: 0,
+            context_window_usage: None,
             running: true,
             agent_busy: false,
             scroll_offset: 0,
             expanded_tools: HashSet::new(),
-            approval_mode: ApprovalMode::Smart,
             pending_approval: None,
             popup: None,
             status_msg: None,
@@ -273,9 +260,10 @@ impl App {
 
         let (tui_tx, mut tui_rx) = mpsc::unbounded_channel::<TuiEvent>();
 
-        // Spawn input + agent event pollers
+        // Spawn input + agent event + approval bridges
         spawn_input_poller(tui_tx.clone(), self.cancel.clone());
         spawn_agent_bridge(&self.event_tx, tui_tx.clone(), self.cancel.clone());
+        spawn_approval_bridge(self.approval_rx.take().unwrap(), tui_tx.clone(), self.cancel.clone());
 
         self.set_status("Ready. Type a message and press Enter. /help for commands.");
 
@@ -304,6 +292,13 @@ impl App {
             TuiEvent::Agent(agent_event) => self.handle_agent_event(agent_event),
             TuiEvent::Resize(_, _) => {
                 // Re-render handles new size automatically.
+            }
+            TuiEvent::Approval(request) => {
+                // A tool needs user approval — show the popup. The agent's
+                // `before_tool_call` hook is blocked on the embedded oneshot
+                // until we call `request.respond(...)`.
+                self.pending_approval = Some(request.clone());
+                self.popup = Some(Popup::Approval(request));
             }
         }
     }
@@ -381,8 +376,16 @@ impl App {
                         self.deny_tool_call().await;
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
-                        self.approval_mode = ApprovalMode::Auto;
-                        self.approve_tool_call().await;
+                        // Switch to auto mode for this and all future tools
+                        if let Some(pa) = self.pending_approval.take() {
+                            self.set_approval_mode(ApprovalMode::Auto);
+                            pa.respond(ApprovalResponse::AutoApprove);
+                            self.set_status(format!(
+                                "Tool {} approved (auto mode for the rest of this session)",
+                                pa.tool_name()
+                            ));
+                        }
+                        self.popup = None;
                     }
                     _ => {}
                 }
@@ -450,6 +453,9 @@ impl App {
                 tool_call_id,
                 tool_name,
             } => {
+                // Note: approval popup is triggered by TuiEvent::Approval
+                // (from ApprovalHooks::before_tool_call), NOT here.
+                // This event fires AFTER approval has been granted.
                 let display = ToolCallDisplay {
                     id: tool_call_id.clone(),
                     name: tool_name.clone(),
@@ -458,18 +464,7 @@ impl App {
                     output: String::new(),
                     is_error: false,
                 };
-                self.tool_calls.insert(tool_call_id.clone(), display);
-
-                // Check if approval needed
-                if self.approval_mode.requires_approval(&tool_name) {
-                    let pa = PendingApproval {
-                        tool_call_id: tool_call_id.clone(),
-                        tool_name: tool_name.clone(),
-                        arguments: String::new(),
-                    };
-                    self.pending_approval = Some(pa.clone());
-                    self.popup = Some(Popup::Approval(pa));
-                }
+                self.tool_calls.insert(tool_call_id, display);
             }
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id,
@@ -490,6 +485,8 @@ impl App {
                 }
             }
             AgentEvent::TurnEnd { usage, .. } => {
+                self.current_turn_input = usage.input_tokens;
+                self.current_turn_output = usage.output_tokens;
                 self.total_input_tokens += usage.input_tokens;
                 self.total_output_tokens += usage.output_tokens;
             }
@@ -500,13 +497,54 @@ impl App {
             AgentEvent::ContextCompacted {
                 messages_before,
                 messages_after,
-                ..
+                tokens_before,
+                tokens_after,
             } => {
+                self.context_window_usage = Some(ContextWindowUsage {
+                    messages_before,
+                    messages_after,
+                    tokens_before,
+                    tokens_after,
+                    was_compacted: true,
+                });
                 self.set_status(format!(
                     "Context compacted: {messages_before} → {messages_after} messages"
                 ));
             }
-            AgentEvent::ContextEdited { .. } => {}
+            AgentEvent::ContextEdited { edit } => {
+                if edit.is_empty() {
+                    self.set_status("Cleared all user edits");
+                } else {
+                    let mut parts: Vec<String> = Vec::new();
+                    if !edit.exclude.is_empty() {
+                        let mut idxs: Vec<usize> = edit.exclude.iter().copied().collect();
+                        idxs.sort();
+                        parts.push(format!("exclude {}", idxs.len()));
+                    }
+                    if !edit.replace.is_empty() {
+                        parts.push(format!("replace {}", edit.replace.len()));
+                    }
+                    self.set_status(format!("Context edit applied: {}", parts.join(", ")));
+                }
+            }
+            AgentEvent::Error {
+                message,
+                retryable,
+                retry_count,
+                max_retries,
+            } => {
+                if retryable {
+                    self.set_status(format!(
+                        "⚠ {message}  (retry {retry_count}/{max_retries})"
+                    ));
+                } else if retry_count > 0 {
+                    self.set_status(format!(
+                        "⚠ {message}  (retries exhausted: {retry_count}/{max_retries})"
+                    ));
+                } else {
+                    self.set_status(format!("⚠ {message}"));
+                }
+            }
         }
     }
 
@@ -553,11 +591,9 @@ impl App {
                 self.running = false;
             }
             "approve" => {
-                self.approval_mode = self.approval_mode.next();
-                self.set_status(format!(
-                    "Approval mode: {}",
-                    self.approval_mode.label()
-                ));
+                let new_mode = self.current_approval_mode().next();
+                self.set_approval_mode(new_mode);
+                self.set_status(format!("Approval mode: {}", new_mode.label()));
             }
             "model" => {
                 if arg.is_empty() {
@@ -601,6 +637,7 @@ impl App {
                     self.total_input_tokens, self.total_output_tokens, self.turn_count
                 ));
             }
+            "edit" => self.handle_edit_command(arg),
             _ => {
                 self.set_status(format!("Unknown command: /{cmd}. Try /help"));
             }
@@ -640,13 +677,11 @@ impl App {
         };
 
         // Send to agent task
-        let label = name.to_string();
-        let status_msg = format!("Switched to provider: {label} (model: {model})");
+        let status_msg = format!("Switched to provider: {name} (model: {model})");
         if self
             .cmd_tx
             .send(AgentCommand::SetProvider {
                 provider,
-                label,
                 model: model.clone(),
             })
             .is_err()
@@ -662,16 +697,137 @@ impl App {
     }
 
     async fn approve_tool_call(&mut self) {
+        if let Some(pa) = self.pending_approval.take() {
+            pa.respond(ApprovalResponse::Approve);
+            self.set_status(format!("Tool {} approved", pa.tool_name()));
+        }
         self.popup = None;
-        self.pending_approval = None;
-        self.set_status("Tool approved (execution continues)");
     }
 
     async fn deny_tool_call(&mut self) {
-        self.popup = None;
         if let Some(pa) = self.pending_approval.take() {
-            self.set_status(format!("Tool {} denied", pa.tool_name));
+            pa.respond(ApprovalResponse::Deny);
+            self.set_status(format!("Tool {} denied", pa.tool_name()));
         }
+        self.popup = None;
+    }
+
+    /// Handle `/edit <sub>` — interactive context editing.
+    ///
+    /// Subcommands:
+    /// - `/edit` or `/edit list` — show message count + edit summary
+    /// - `/edit exclude <comma-separated-indices>` — exclude messages from future LLM calls
+    /// - `/edit replace <idx>:<text>` — replace a message's content with new text
+    /// - `/edit clear` — clear all persistent user edits
+    fn handle_edit_command(&mut self, arg: &str) {
+        let arg = arg.trim();
+        if arg.is_empty() || arg == "list" {
+            let mut lines: Vec<String> = Vec::new();
+            for (i, msg) in self.messages.iter().enumerate() {
+                let role = match msg.role {
+                    lim_core::message::Role::User => "user",
+                    lim_core::message::Role::Assistant => "asst ",
+                    lim_core::message::Role::Tool => "tool ",
+                    lim_core::message::Role::System => "sys  ",
+                };
+                let preview: String = msg
+                    .content
+                    .iter()
+                    .find_map(|b| match b {
+                        lim_core::content::ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let preview = if preview.len() > 50 {
+                    format!("{}...", &preview[..47])
+                } else {
+                    preview
+                };
+                lines.push(format!("  [{i}] {role} {preview}"));
+            }
+            if lines.is_empty() {
+                self.set_status("No messages yet");
+            } else {
+                self.set_status(format!("Messages:\n{}", lines.join("\n")));
+            }
+            return;
+        }
+
+        let (sub, rest) = match arg.split_once(' ') {
+            Some((s, r)) => (s, r.trim()),
+            None => (arg, ""),
+        };
+
+        match sub {
+            "exclude" => {
+                let indices: Vec<usize> = rest
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .collect();
+                if indices.is_empty() {
+                    self.set_status("Usage: /edit exclude <comma-separated-indices>  e.g. /edit exclude 1,3,5");
+                    return;
+                }
+                let edit = ContextEdit::excluding(indices.iter().copied());
+                if self.cmd_tx.send(AgentCommand::ApplyEdit(edit)).is_err() {
+                    self.set_status("Error: agent task is not running");
+                } else {
+                    self.set_status(format!("Excluded {} message(s) from future LLM calls", indices.len()));
+                }
+            }
+            "replace" => {
+                // Format: <idx>:<new text>
+                let (idx_str, text) = match rest.split_once(':') {
+                    Some((i, t)) => (i, t.trim()),
+                    None => {
+                        self.set_status("Usage: /edit replace <idx>:<new text>  e.g. /edit replace 2:summarized");
+                        return;
+                    }
+                };
+                let idx: usize = match idx_str.trim().parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        self.set_status(format!("Invalid index: {idx_str}"));
+                        return;
+                    }
+                };
+                if text.is_empty() {
+                    self.set_status("Replacement text is empty");
+                    return;
+                }
+                let edit = ContextEdit::none().replace(idx, vec![lim_core::content::ContentBlock::text(text)]);
+                if self.cmd_tx.send(AgentCommand::ApplyEdit(edit)).is_err() {
+                    self.set_status("Error: agent task is not running");
+                } else {
+                    self.set_status(format!("Replaced message {idx}'s content"));
+                }
+            }
+            "clear" => {
+                if self.cmd_tx.send(AgentCommand::ClearEdits).is_err() {
+                    self.set_status("Error: agent task is not running");
+                } else {
+                    self.set_status("Cleared all user edits (will take effect on next turn)");
+                }
+            }
+            _ => {
+                self.set_status(format!(
+                    "Unknown /edit subcommand: {sub}. Try: list, exclude, replace, clear"
+                ));
+            }
+        }
+    }
+
+    /// Read the current approval mode from the shared state.
+    fn current_approval_mode(&self) -> ApprovalMode {
+        self.shared_mode
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(ApprovalMode::Smart)
+    }
+
+    /// Update the shared approval mode (affects the agent's ApprovalHooks).
+    fn set_approval_mode(&self, mode: ApprovalMode) {
+        self.hooks.set_mode(mode);
     }
 
     // ── Input editing helpers ──
@@ -799,6 +955,18 @@ impl App {
         self.total_output_tokens
     }
 
+    pub fn current_turn_input(&self) -> u64 {
+        self.current_turn_input
+    }
+
+    pub fn current_turn_output(&self) -> u64 {
+        self.current_turn_output
+    }
+
+    pub fn context_window_usage(&self) -> Option<&ContextWindowUsage> {
+        self.context_window_usage.as_ref()
+    }
+
     pub fn turn_count(&self) -> usize {
         self.turn_count
     }
@@ -808,7 +976,7 @@ impl App {
     }
 
     pub fn approval_mode(&self) -> ApprovalMode {
-        self.approval_mode
+        self.current_approval_mode()
     }
 
     pub fn popup(&self) -> Option<&Popup> {
@@ -826,70 +994,5 @@ impl App {
     /// Check if a tool call's output should be fully expanded.
     pub fn is_tool_expanded(&self, id: &ToolCallId) -> bool {
         self.expanded_tools.contains(id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn approval_mode_cycle() {
-        assert_eq!(ApprovalMode::Auto.next(), ApprovalMode::Smart);
-        assert_eq!(ApprovalMode::Smart.next(), ApprovalMode::Always);
-        assert_eq!(ApprovalMode::Always.next(), ApprovalMode::Auto);
-    }
-
-    #[test]
-    fn approval_mode_labels() {
-        assert_eq!(ApprovalMode::Auto.label(), "auto");
-        assert_eq!(ApprovalMode::Smart.label(), "smart");
-        assert_eq!(ApprovalMode::Always.label(), "always");
-    }
-
-    #[test]
-    fn smart_mode_approves_readonly_tools() {
-        let mode = ApprovalMode::Smart;
-        assert!(!mode.requires_approval("read"));
-        assert!(!mode.requires_approval("glob"));
-        assert!(!mode.requires_approval("grep"));
-        assert!(!mode.requires_approval("ls"));
-    }
-
-    #[test]
-    fn smart_mode_requires_approval_for_writes() {
-        let mode = ApprovalMode::Smart;
-        assert!(mode.requires_approval("bash"));
-        assert!(mode.requires_approval("edit"));
-        assert!(mode.requires_approval("write"));
-        assert!(mode.requires_approval("unknown_tool"));
-    }
-
-    #[test]
-    fn auto_mode_never_requires_approval() {
-        let mode = ApprovalMode::Auto;
-        assert!(!mode.requires_approval("bash"));
-        assert!(!mode.requires_approval("edit"));
-        assert!(!mode.requires_approval("read"));
-    }
-
-    #[test]
-    fn always_mode_always_requires_approval() {
-        let mode = ApprovalMode::Always;
-        assert!(mode.requires_approval("bash"));
-        assert!(mode.requires_approval("read"));
-        assert!(mode.requires_approval("glob"));
-    }
-
-    #[test]
-    fn pending_approval_accessors() {
-        let id = ToolCallId::new();
-        let pa = PendingApproval {
-            tool_call_id: id.clone(),
-            tool_name: "bash".to_string(),
-            arguments: r#"{"cmd":"ls"}"#.to_string(),
-        };
-        assert_eq!(pa.tool_name(), "bash");
-        assert_eq!(pa.arguments(), r#"{"cmd":"ls"}"#);
     }
 }
