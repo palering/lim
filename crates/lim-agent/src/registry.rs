@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use lim_core::error::{LimError, Result};
-use lim_core::tool::ToolSchema;
+use lim_core::tool::{ToolCategory, ToolSchema};
 
 use crate::tool::Tool;
 
@@ -31,6 +31,14 @@ impl ToolRegistry {
     /// Look up a tool by name.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
+    }
+
+    /// Look up a tool's category by name.
+    ///
+    /// Returns `None` if the tool is not registered. Used by `ApprovalHooks`
+    /// to decide whether a tool call requires user approval.
+    pub fn category_of(&self, name: &str) -> Option<ToolCategory> {
+        self.tools.get(name).map(|t| t.category())
     }
 
     /// Get schemas for all registered tools (sent to the LLM).

@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use lim_core::error::{LimError, Result};
+use lim_core::guard::{ToolGuard, TrustLevel};
 
 use crate::executor::{
     CommandOutput, CommandSpec, EditReport, Executor, ExecutorCapabilities, ExecutorFuture, FileEdit,
@@ -46,6 +47,12 @@ impl LocalExecutor {
     #[allow(deprecated)]
     pub fn permissive() -> Self {
         Self::new(DefaultPolicy::permissive())
+    }
+}
+
+impl ToolGuard for LocalExecutor {
+    fn trust_level(&self) -> TrustLevel {
+        self.policy.trust_level()
     }
 }
 

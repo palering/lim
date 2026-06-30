@@ -45,7 +45,9 @@ use lim_llm::providers::config::LimConfig;
 use lim_llm::Provider;
 
 pub use app::App;
-pub use approval::{ApprovalHooks, ApprovalMode, ApprovalRequest, ApprovalResponse};
+pub use approval::{
+    ApprovalHooks, ApprovalMode, ApprovalRequest, ApprovalResponse, SharedToolLists, ToolLists,
+};
 pub use event::TuiEvent;
 
 /// Configuration for the TUI session.
@@ -59,6 +61,9 @@ pub struct TuiConfig {
     pub lim_config: LimConfig,
     pub event_tx: broadcast::Sender<lim_core::event::EventEnvelope>,
     pub cancel: CancellationToken,
+    /// Trust level for the session — drives the Trust × ApprovalMode linkage.
+    /// When `Permissive`, the approval layer enforces `Always` mode.
+    pub trust_level: lim_core::TrustLevel,
 }
 
 /// Run the TUI. Takes ownership of the agent setup; the caller provides the
@@ -73,6 +78,7 @@ pub async fn run(config: TuiConfig) -> Result<()> {
         lim_config,
         event_tx,
         cancel,
+        trust_level,
     } = config;
 
     let agent_config = AgentConfig {
@@ -83,8 +89,23 @@ pub async fn run(config: TuiConfig) -> Result<()> {
     // Set up approval channel: ApprovalHooks sends ApprovalRequest to the TUI,
     // TUI responds via an embedded oneshot sender.
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-    let shared_mode = Arc::new(Mutex::new(ApprovalMode::Smart));
-    let hooks = Arc::new(ApprovalHooks::new(approval_tx, shared_mode.clone()));
+    let shared_mode = Arc::new(Mutex::new(ApprovalMode::AllowNonScript));
+    let shared_lists = Arc::new(Mutex::new(ToolLists::new()));
+    // Build guard based on trust level — used for Permissive+Auto linkage.
+    let guard: Arc<dyn lim_core::ToolGuard> = match trust_level {
+        lim_core::TrustLevel::Permissive => Arc::new(lim_core::PermissiveGuard),
+        lim_core::TrustLevel::Workspace => Arc::new(lim_core::WorkspaceGuard),
+        lim_core::TrustLevel::Sandbox => Arc::new(lim_core::WorkspaceGuard), // Phase 4
+    };
+    let hooks = Arc::new(
+        ApprovalHooks::new(
+            approval_tx,
+            shared_mode.clone(),
+            Arc::clone(&registry),
+            shared_lists.clone(),
+        )
+        .with_guard(guard),
+    );
 
     let agent = AgentLoop::new(provider, registry, event_tx.clone(), cancel.clone())
         .with_config(agent_config)
@@ -99,6 +120,7 @@ pub async fn run(config: TuiConfig) -> Result<()> {
         cancel,
         approval_rx,
         shared_mode,
+        shared_lists,
         hooks,
     );
     app.run().await

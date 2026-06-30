@@ -5,7 +5,7 @@ use camino::Utf8PathBuf;
 use lim_agent::tool::{Tool, ToolFuture};
 use lim_core::error::{LimError, Result};
 use lim_core::id::ToolCallId;
-use lim_core::tool::{ToolResult, ToolSchema};
+use lim_core::tool::{ToolCategory, ToolResult, ToolSchema};
 use lim_executor::executor::{Executor, FileEdit};
 
 /// Tool to apply structured edits to a file (find-and-replace).
@@ -47,6 +47,10 @@ impl Tool for EditFileTool {
                 "required": ["path", "old_string", "new_string"]
             }),
         )
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Write
     }
 
     fn execute(

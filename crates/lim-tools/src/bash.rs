@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use lim_agent::tool::{Tool, ToolFuture};
 use lim_core::error::{LimError, Result};
 use lim_core::id::ToolCallId;
-use lim_core::tool::{ToolResult, ToolSchema};
+use lim_core::tool::{ToolCategory, ToolResult, ToolSchema};
 use lim_executor::executor::{CommandSpec, Executor};
 
 /// Tool to execute shell commands.
@@ -39,6 +39,10 @@ impl Tool for BashTool {
                 "required": ["command"]
             }),
         )
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Script
     }
 
     fn execute(

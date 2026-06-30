@@ -19,7 +19,9 @@ use lim_core::event::AgentEvent;
 use lim_core::id::{MessageId, ToolCallId};
 use lim_core::message::AgentMessage;
 
-use crate::approval::{ApprovalHooks, ApprovalMode, ApprovalRequest, ApprovalResponse};
+use crate::approval::{
+    ApprovalHooks, ApprovalMode, ApprovalRequest, ApprovalResponse, SharedToolLists,
+};
 use crate::event::{TuiEvent, spawn_agent_bridge, spawn_approval_bridge, spawn_input_poller};
 use crate::terminal::TerminalGuard;
 use crate::ui;
@@ -84,6 +86,7 @@ pub struct App {
 
     // Approval — shared with the agent's ApprovalHooks
     shared_mode: Arc<Mutex<ApprovalMode>>,
+    shared_lists: SharedToolLists,
     hooks: Arc<ApprovalHooks>,
     /// Receiver for approval requests from the agent hook.
     /// Taken by `spawn_approval_bridge` when the main loop starts.
@@ -163,6 +166,7 @@ impl App {
         cancel: CancellationToken,
         approval_rx: mpsc::Receiver<ApprovalRequest>,
         shared_mode: Arc<Mutex<ApprovalMode>>,
+        shared_lists: SharedToolLists,
         hooks: Arc<ApprovalHooks>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
@@ -229,6 +233,7 @@ impl App {
             event_tx,
             cancel: cancel.clone(),
             shared_mode,
+            shared_lists,
             hooks,
             approval_rx: Some(approval_rx),
             input: String::new(),
@@ -595,6 +600,8 @@ impl App {
                 self.set_approval_mode(new_mode);
                 self.set_status(format!("Approval mode: {}", new_mode.label()));
             }
+            "allow" => self.handle_allow_command(arg),
+            "deny" => self.handle_deny_command(arg),
             "model" => {
                 if arg.is_empty() {
                     self.set_status(format!("Current model: {}", self.model));
@@ -817,12 +824,60 @@ impl App {
         }
     }
 
+    /// Handle `/allow [name]` — add tool to allowlist, or list current lists.
+    ///
+    /// - `/allow` — show current allowlist + denylist
+    /// - `/allow bash` — add bash to allowlist (skip prompt even in Always mode)
+    fn handle_allow_command(&mut self, arg: &str) {
+        let arg = arg.trim();
+        let status = match self.shared_lists.lock() {
+            Ok(lists) if arg.is_empty() => {
+                let allow: Vec<_> = lists.allowlist.iter().cloned().collect();
+                let deny: Vec<_> = lists.denylist.iter().cloned().collect();
+                format!("Allow: [{}] | Deny: [{}]", allow.join(", "), deny.join(", "))
+            }
+            Ok(mut lists) => {
+                lists.allow(arg.to_string());
+                format!("Added `{arg}` to allowlist (will skip prompt)")
+            }
+            Err(_) => "lock poisoned".to_string(),
+        };
+        self.set_status(status);
+    }
+
+    /// Handle `/deny [name]` — add tool to denylist, or clear with `/deny -clear <name>`.
+    ///
+    /// - `/deny` — show current lists (same as /allow)
+    /// - `/deny bash` — add bash to denylist (reject immediately, highest priority)
+    /// - `/deny -clear bash` — remove bash from denylist
+    fn handle_deny_command(&mut self, arg: &str) {
+        let arg = arg.trim();
+        let status = match self.shared_lists.lock() {
+            Ok(lists) if arg.is_empty() => {
+                let allow: Vec<_> = lists.allowlist.iter().cloned().collect();
+                let deny: Vec<_> = lists.denylist.iter().cloned().collect();
+                format!("Allow: [{}] | Deny: [{}]", allow.join(", "), deny.join(", "))
+            }
+            Ok(mut lists) => {
+                if let Some(name) = arg.strip_prefix("-clear ") {
+                    lists.clear_deny(name.trim());
+                    format!("Removed `{}` from denylist", name.trim())
+                } else {
+                    lists.deny(arg.to_string());
+                    format!("Added `{arg}` to denylist (will reject immediately)")
+                }
+            }
+            Err(_) => "lock poisoned".to_string(),
+        };
+        self.set_status(status);
+    }
+
     /// Read the current approval mode from the shared state.
     fn current_approval_mode(&self) -> ApprovalMode {
         self.shared_mode
             .lock()
             .map(|g| *g)
-            .unwrap_or(ApprovalMode::Smart)
+            .unwrap_or(ApprovalMode::AllowNonScript)
     }
 
     /// Update the shared approval mode (affects the agent's ApprovalHooks).

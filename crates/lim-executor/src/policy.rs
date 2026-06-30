@@ -1,6 +1,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 
 use lim_core::error::{LimError, Result};
+use lim_core::guard::{ToolGuard, TrustLevel};
 
 /// L0 permission policy — reduces accidental misuse but is NOT a sandbox.
 ///
@@ -28,6 +29,8 @@ pub struct DefaultPolicy {
     /// Command patterns that are always rejected (substring match on the
     /// full command line).
     dangerous_commands: Vec<String>,
+    /// Trust level — tracks whether this policy is permissive or workspace.
+    trust_level: TrustLevel,
 }
 
 impl DefaultPolicy {
@@ -39,6 +42,7 @@ impl DefaultPolicy {
         Self {
             workspace_roots,
             dangerous_commands: default_dangerous_commands(),
+            trust_level: TrustLevel::Workspace,
         }
     }
 
@@ -50,7 +54,13 @@ impl DefaultPolicy {
         Self {
             workspace_roots: Vec::new(),
             dangerous_commands: Vec::new(),
+            trust_level: TrustLevel::Permissive,
         }
+    }
+
+    /// Current trust level.
+    pub fn trust_level(&self) -> TrustLevel {
+        self.trust_level
     }
 
     /// Resolve a path to its canonical form, following symlinks.
@@ -185,6 +195,12 @@ fn default_dangerous_commands() -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+impl ToolGuard for DefaultPolicy {
+    fn trust_level(&self) -> TrustLevel {
+        self.trust_level
+    }
 }
 
 impl PermissionPolicy for DefaultPolicy {

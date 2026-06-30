@@ -2,6 +2,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::ToolCallId;
 
+/// Category of a tool, used by [`ApprovalMode`](../../lim_tui/approval/enum.ApprovalMode.html)
+/// to decide whether a tool call requires user approval.
+///
+/// Tools declare their category via [`Tool::category`](../../lim_agent/tool/trait.Tool.html#method.category).
+/// The default category is `ReadOnly` — tools that modify state or execute
+/// commands should override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolCategory {
+    /// Read-only tools (read, glob, grep, ls). Never modify state.
+    ReadOnly,
+    /// Write tools (write, edit). Modify files within workspace.
+    Write,
+    /// Script execution tools (bash). Can execute arbitrary commands.
+    Script,
+    /// Network access tools (fetch, web_search).
+    Network,
+    /// Remote tools (MCP, external services). Phase 4.
+    Remote,
+}
+
+impl ToolCategory {
+    /// Whether this category is considered "safe" (no state mutation, no
+    /// arbitrary code execution, no network).
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
+
 /// Schema definition for a tool that the agent can invoke.
 ///
 /// This is sent to the LLM as part of the tool definitions, so it can
