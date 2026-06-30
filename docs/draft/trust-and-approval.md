@@ -170,23 +170,51 @@ Tools construct `Operation` before execute, pass to `ToolGuard::check`.
 
 ## Sandbox Backends (Phase 4)
 
-Based on research, adopt Codex/Claude Code validated combos, not self-rolled:
+Based on three supplementary research investigations (BPF, ASRT/MXC reusability, Wasm), lim adopts a **self-built thin layer + platform-native primitive crate combo**. None of the existing sandbox projects can be used as a hard dependency; all serve as design references.
 
-| Platform | Backend | Startup | Status |
+### Why not directly depend on existing implementations
+
+| Project | Actual situation | Why not hard-depend |
+|---|---|---|
+| Anthropic `sandbox-runtime` | Real name `anthropic-experimental/sandbox-runtime`, **TypeScript/Node.js** package (`@anthropic-ai/sandbox-runtime` v0.0.62), Apache-2.0 | Node.js runtime distribution cost conflicts with lim's Containment Principle; Rust FFI unrealistic; only spawn CLI mode works, but Node runtime still needed |
+| Microsoft MXC | `microsoft/mxc`, **Rust 72.5%**, MIT, but v0.7.0-alpha, README explicitly states "no MXC profiles should be treated as security boundaries currently" | Not yet stable, no crate published to crates.io, only ~1 month old (Build 2026 public release) |
+| BPF (Tetragon/Tracee) | Technically capable of per-process-tree file access interception + real-time block | Linux-only; requires root/CAP_BPF (mainstream distros `unprivileged_bpf_disabled=1`); conflicts with Containment Principle; Codex/Claude Code both chose not to use BPF |
+| Wasm (Wasmtime) | WASI 1.0 not yet production-ready (June 2026) | **Fatal**: WASI has no `fork`/`exec`, bash tool cannot be Wasm-ized — this is lim's core capability; no mainstream agent uses Wasm as harness sandbox |
+
+### Self-built path: platform-native primitives
+
+```
+crates/lim-sandbox/
+├── trait.rs           # SandboxBackend trait
+├── linux.rs           # landlock 0.4.5 + libseccomp 0.4.0 (cargo add)
+├── macos.rs           # sandbox_init() direct call (nix/libc crate, NOT sandbox-exec CLI)
+└── windows.rs         # windows 0.62 crate's AppContainer API (Win32_Security_Isolation)
+```
+
+| Platform | Backend | Startup | Reference |
 |---|---|---|---|
-| Linux | Landlock + seccomp + bwrap | < 50ms | reference Codex `linux-sandbox` crate |
-| macOS | Seatbelt (`sandbox-exec`) | < 50ms | DEPRECATED but usable for CLI; watch Apple removal |
-| Windows | Restricted Token + ACL | native | reference Codex `windows-sandbox-rs` |
-| Cross-platform (future) | Firecracker microVM (E2B pattern) | < 200ms | cloud agent execution |
+| Linux | `landlock` crate + `libseccomp` crate combo | < 50ms | Codex `linux-sandbox` crate (Apache-2.0, code reading reference) |
+| macOS | `sandbox_init()` direct call via `nix`/`libc` crate, dynamic TinyScheme profile generation | < 50ms | MXC `seatbelt_common` crate design (MIT, design blueprint); NOT calling `sandbox-exec` CLI to avoid external binary dependency |
+| Windows | `windows` crate AppContainer API | native | MXC `appcontainer_common` reference |
 
-**Sandbox crate design** (`crates/lim-sandbox/`):
-- `Sandbox` trait with `isolate_and_exec(spec) -> Result<Output>`
-- `SandboxExecutor` wraps `Box<dyn Executor>` + `Box<dyn Sandbox>`
-- Backend selection via config `[sandbox] backend = "auto|bwrap|seatbelt|none"`
-- `auto` picks OS default; `none` = no sandbox (fallback to LocalExecutor + policy only)
-- Reference `anthropics/claude-code-sandboxing` (open-sourced) and Codex crates for design, self-implement (avoid direct dep coupling)
+**Key design decisions**:
+- **macOS does NOT call `sandbox-exec` CLI** — directly uses `sandbox_init()` in `Command::pre_exec` (MXC's approach, more robust, avoids external binary dependency)
+- **Linux uses crate combination not vendoring** — `landlock` 0.4.5 (11.2M downloads, MIT/Apache-2.0) + `libseccomp` 0.4.0 (1.66M downloads) already do the heavy lifting; no need to vendor Codex's entire `linux-sandbox` crate
+- **Network isolation** (Phase 4): reference ASRT's proxy model (HTTP proxy + SOCKS5 + domain allowlist), simplified to "all deny + allowlist domains" local proxy in Phase 1-2
 
-**Microsoft MXC/LiteBox**: monitor as cross-platform inspiration. LiteBox's Rust library-OS approach is architecturally aligned with lim's embeddable crate model — may inform a future `lim-sandbox/litebox` backend if it matures.
+### BPF as optional Linux observability layer (Phase 3+)
+
+Not the default backend. Role: observability / audit / advanced enforcement. Integration method: detect if Tetragon/Tracee daemon is running; if so, register policy via its API; lim itself does not load BPF programs. Use `matchNamespaces` (not `matchBinaries`, to avoid shebang trap) for process-tree filtering.
+
+### Wasm as L2 extension plugin runtime (future, 12-18 months)
+
+Not the main sandbox. Reserved for "user uploads .wasm tool plug-and-play" scenario, borrowing Extism's pattern. Trigger condition: WASI 1.0 stable + component model mature + real user extension demand. Until then, technical pre-research only, no mainline investment.
+
+**Architecture relationship**:
+```
+L0 policy (current policy.rs)  →  L1 OS sandbox (lim-sandbox: bwrap/Seatbelt/Landlock)  →  L2 optional Wasm plugin runtime (future)
+```
+Wasm is L2 extension layer, orthogonal to L1. If lim doesn't accept user .wasm plugins, pure OS sandbox suffices, no double layer needed.
 
 ## System Prompt Layer (3-layer persistence)
 
@@ -307,14 +335,16 @@ This design draws from:
 | Tool | Borrowed idea |
 |---|---|
 | **Codex (OpenAI)** | 3×4 sandbox_mode × approval_policy matrix; Landlock+seccomp+bwrap Linux combo; safe command allowlist; protected subpaths (`.git/`); env var masking; `windows-sandbox-rs` restricted token; separate sandbox crates |
-| **Claude Code (Anthropic)** | boundary-based vs permission-based philosophy; bwrap/Seatbelt OS primitives over Docker; unix domain socket + proxy for network; `<system-reminder>` message-layer injection; cache-safe forking for compaction; 6 permission modes; open-source `claude-code-sandboxing` reference |
+| **Claude Code (Anthropic)** | boundary-based vs permission-based philosophy; bwrap/Seatbelt OS primitives over Docker; unix domain socket + proxy for network; `<system-reminder>` message-layer injection; cache-safe forking for compaction; 6 permission modes. **Note**: the widely-cited `anthropics/claude-code-sandboxing` repo does NOT exist (GitHub 404); the real project is `anthropic-experimental/sandbox-runtime` — TypeScript/Node.js package, Apache-2.0, not Rust, not suitable as lim hard-dependency |
 | **Trae** | sandbox.json filesystem readWrite/readOnly with "readOnly wins on conflict"; path priority (longer = more precise); command strategy (allowlist → outside sandbox, else inside + failure retry); enterprise command blocklist text-match |
 | **Goose** | Inspector stack (SecurityInspector → EgressInspector → AdversaryInspector → PermissionInspector → RepetitionInspector); AdversaryInspector LLM-as-judge for risky tools; SmartApprove reading `ToolAnnotations.read_only_hint`; 31 env var blocklist; secret keyring default |
 | **Codex (system prompt)** | 5-layer input injection (permissions → developer → AGENTS.md → env → user); role priority (system > developer > user > assistant); auto-compact with `encrypted_content` latent understanding |
 | **Claude Code (system prompt)** | 10-step SystemPromptBuilder with static/dynamic boundary; `CLAUDE.md` at prompt end for Recency; dynamic info via `<system-reminder>` not system prompt edit; "don't add/remove tools mid-conversation, model state as tools" |
-| **Microsoft MXC** | 4-tier isolation (process → session → VM → cloud); kernel-level enforcement not Agent alignment; protocol open-sourced |
-| **Microsoft LiteBox** | Rust Library OS approach; package OS services into runtime; reduced host interface attack surface; embeddable crate form — architecturally aligned with lim |
-| **E2B / Firecracker** | microVM for cloud agent execution; independent kernel + memory per sandbox; ~15M sessions/month proves scalability |
+| **Microsoft MXC** | `microsoft/mxc`, Rust 72.5% + MIT, but v0.7.0-alpha, self-declared "not a security boundary yet". 4-tier isolation (process → session → VM → cloud); `seatbelt_common` crate design (TinyScheme profile via `sandbox_init()` not CLI) is the most valuable blueprint for lim's macOS backend |
+| **Microsoft LiteBox** | Rust Library OS approach; package OS services into runtime; reduced host interface attack surface; embeddable crate form — architecturally aligned with lim's embeddable crate model |
+| **E2B / Firecracker** | microVM for cloud agent execution; independent kernel + memory per sandbox; ~15M sessions/month proves scalability; overkill for lim's local CLI use case |
+| **BPF (Tetragon/Tracee)** | Technically the most precise: per-process-tree file-access interception + real-time block via `matchNamespaces` + override return. But Linux-only + requires root/CAP_BPF + conflicts with lim Containment Principle. Codex/Claude Code both chose NOT to use BPF — strong engineering signal. Reserved as optional Linux observability layer (Phase 3+) |
+| **Wasm (Wasmtime)** | WASI 1.0 not production-ready (June 2026). Fatal: no `fork`/`exec`, bash tool cannot be Wasm-ized. No mainstream agent uses Wasm as harness sandbox. Reserved for future L2 plugin runtime (12-18 months), borrowing Extism pattern for "user uploads .wasm tool" scenario |
 
 ## Open Questions
 
