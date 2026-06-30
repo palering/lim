@@ -56,6 +56,7 @@ lim/
 
 - [agent-sandbox-landscape.md](research/agent-sandbox-landscape.md) — 2025-2026 survey of sandbox mechanisms across Codex/Claude Code/Trae/Qoder/Cursor/Aider/Goose/OpenHands/Devin/Roo Code. Covers Landlock/bwrap/Seatbelt/microVM/Wasm + Microsoft MXC/LiteBox.
 - [system-prompt-persistence.md](research/system-prompt-persistence.md) — How agents keep system prompt instructions effective: per-turn resend + prompt caching, message-layer `<system-reminder>`, tool-layer hard constraints. Claude Code 10-step assembly + Codex 5-layer injection.
+- [mxc-feasibility-study.md](research/mxc-feasibility-study.md) — Deep dive on Microsoft MXC as lim-sandbox backend. Architecture near-perfect fit (mxc-sdk library API 1:1 with Executor trait), but 3 hard blockers prevent immediate adoption. Includes adoption conditions + quarterly review checklist.
 
 ### review/
 
