@@ -620,6 +620,11 @@ async fn run_tui(
         lim_config: config,
         event_tx,
         cancel: cancel.clone(),
+        trust_level: if trust.is_permissive() {
+            lim_core::TrustLevel::Permissive
+        } else {
+            lim_core::TrustLevel::Workspace
+        },
     };
 
     // Run the TUI — this consumes event_tx; when the TUI exits, the channel

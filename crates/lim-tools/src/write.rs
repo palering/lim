@@ -5,7 +5,7 @@ use camino::Utf8PathBuf;
 use lim_agent::tool::{Tool, ToolFuture};
 use lim_core::error::{LimError, Result};
 use lim_core::id::ToolCallId;
-use lim_core::tool::{ToolResult, ToolSchema};
+use lim_core::tool::{ToolCategory, ToolResult, ToolSchema};
 use lim_executor::executor::Executor;
 
 /// Tool to write file contents atomically.
@@ -43,6 +43,10 @@ impl Tool for WriteFileTool {
                 "required": ["path", "content"]
             }),
         )
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Write
     }
 
     fn execute(

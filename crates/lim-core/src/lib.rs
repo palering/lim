@@ -2,6 +2,7 @@ pub mod content;
 pub mod context_edit;
 pub mod error;
 pub mod event;
+pub mod guard;
 pub mod id;
 pub mod message;
 pub mod stop_reason;
@@ -13,6 +14,7 @@ pub use content::ContentBlock;
 pub use context_edit::{ContextEdit, apply_edit, compose_edits};
 pub use error::{LimError, Result};
 pub use event::{AgentEvent, EventEnvelope};
+pub use guard::{PermissiveGuard, ToolGuard, TrustLevel, WorkspaceGuard};
 pub use id::{
     ArtifactId, BranchId, MessageId, SessionId, ToolCallId, TraceId, TurnId,
 };

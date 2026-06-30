@@ -4,7 +4,7 @@ use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 
 use lim_core::error::Result;
-use lim_core::tool::{ToolResult, ToolSchema};
+use lim_core::tool::{ToolCategory, ToolResult, ToolSchema};
 
 /// Boxed future type for async tool execution (dyn-compatible).
 pub type ToolFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -19,6 +19,15 @@ pub trait Tool: Send + Sync {
 
     /// Schema sent to the LLM so it can generate valid tool calls.
     fn schema(&self) -> ToolSchema;
+
+    /// Category for approval decisions. Default: `ReadOnly`.
+    ///
+    /// Tools that modify state, execute commands, or access network should
+    /// override to declare their category. The TUI's `ApprovalMode` uses
+    /// this to decide whether to prompt the user.
+    fn category(&self) -> ToolCategory {
+        ToolCategory::ReadOnly
+    }
 
     /// Execute the tool with validated arguments.
     ///
