@@ -168,41 +168,61 @@ pub enum Operation {
 
 Tools construct `Operation` before execute, pass to `ToolGuard::check`.
 
-## Sandbox Backends (Phase 4)
+## Sandbox Backends (Phase 4, deferred)
 
-Based on three supplementary research investigations (BPF, ASRT/MXC reusability, Wasm), lim adopts a **self-built thin layer + platform-native primitive crate combo**. None of the existing sandbox projects can be used as a hard dependency; all serve as design references.
+**Priority deferred per project decision (2026-06-30)**. lim Phase 1-3 work does not depend on sandbox. When lim reaches Phase 4 (untrusted code execution), the strategy is:
 
-### Why not directly depend on existing implementations
+1. **Primary plan**: Wait for Microsoft MXC to mature, then adopt as `MxcExecutor` (~300 lines, library mode via `mxc-sdk` crate). Architecture is near-perfect fit — see [../research/mxc-feasibility-study.md](../research/mxc-feasibility-study.md).
+2. **Fallback if MXC doesn't mature**: Self-built thin layer using `landlock` + `libseccomp` crates (Linux) + `sandbox_init()` direct call (macOS) + `windows` crate AppContainer API (Windows). Estimated 5-10 days, ~1700-2600 lines full-platform.
 
-| Project | Actual situation | Why not hard-depend |
-|---|---|---|
-| Anthropic `sandbox-runtime` | Real name `anthropic-experimental/sandbox-runtime`, **TypeScript/Node.js** package (`@anthropic-ai/sandbox-runtime` v0.0.62), Apache-2.0 | Node.js runtime distribution cost conflicts with lim's Containment Principle; Rust FFI unrealistic; only spawn CLI mode works, but Node runtime still needed |
-| Microsoft MXC | `microsoft/mxc`, **Rust 72.5%**, MIT, but v0.7.0-alpha, README explicitly states "no MXC profiles should be treated as security boundaries currently" | Not yet stable, no crate published to crates.io, only ~1 month old (Build 2026 public release) |
-| BPF (Tetragon/Tracee) | Technically capable of per-process-tree file access interception + real-time block | Linux-only; requires root/CAP_BPF (mainstream distros `unprivileged_bpf_disabled=1`); conflicts with Containment Principle; Codex/Claude Code both chose not to use BPF |
-| Wasm (Wasmtime) | WASI 1.0 not yet production-ready (June 2026) | **Fatal**: WASI has no `fork`/`exec`, bash tool cannot be Wasm-ized — this is lim's core capability; no mainstream agent uses Wasm as harness sandbox |
+### Why MXC is the preferred future backend
 
-### Self-built path: platform-native primitives
+Based on deep feasibility study ([../research/mxc-feasibility-study.md](../research/mxc-feasibility-study.md)):
+
+- **Architecture 1:1 fit**: `mxc-sdk` library crate (PR #556) provides `Sandbox` handle with `kill/wait/timeout/stdio` that maps almost exactly to lim's `Executor::run_command` trait
+- **Cross-platform Rust**: Rust 72.5%, MIT license, three platforms (Linux bwrap + macOS seatbelt + Windows AppContainer)
+- **Containment-aligned**: `--config-base64` config passing, no temp files; `nestedPty: true` default for bash tool
+- **Non-lock-in**: MXC wraps the same OS primitives lim would call; if MXC stops, fork or shell-out fallback is straightforward
+
+### MXC adoption conditions (ALL THREE must be met)
+
+lim integrates `MxcExecutor` when:
+
+1. **Schema leaves alpha**: stable `1.0` (or `0.x` non-alpha with documented compat commitment)
+2. **`mxc-sdk` Rust crate published to crates.io** (or stable signed binaries with documented release cadence)
+3. **README removes "not a security boundary" warning** — Microsoft considers it production-grade for security-sensitive use
+
+**Quarterly review checklist** (until adoption):
+- [ ] MXC version bump and release notes
+- [ ] "not a security boundary" warning removed?
+- [ ] `mxc-sdk` published to crates.io?
+- [ ] Schema version (still alpha?)
+- [ ] macOS seatbelt backend stability claims
+- [ ] Prototype `MxcExecutor` against lim's `Executor` trait
+
+### Why not adopt MXC now
+
+- README top-banner warning "no MXC profiles should be treated as security boundaries currently" — known overly-permissive cases
+- Schema `0.7.0-alpha`, semver §4 allows arbitrary breakage; macOS seatbelt stable only 18 days (as of 2026-06-30)
+- `mxc-sdk` Rust crate only 5 days old (PR #556), not on crates.io; git-dep doesn't support subdir
+
+### Fallback self-built path (if MXC doesn't mature)
 
 ```
 crates/lim-sandbox/
 ├── trait.rs           # SandboxBackend trait
 ├── linux.rs           # landlock 0.4.5 + libseccomp 0.4.0 (cargo add)
-├── macos.rs           # sandbox_init() direct call (nix/libc crate, NOT sandbox-exec CLI)
-└── windows.rs         # windows 0.62 crate's AppContainer API (Win32_Security_Isolation)
+├── macos.rs           # sandbox_init() direct call (nix/libc, NOT sandbox-exec CLI)
+└── windows.rs         # windows 0.62 crate's AppContainer API
 ```
 
-| Platform | Backend | Startup | Reference |
-|---|---|---|---|
-| Linux | `landlock` crate + `libseccomp` crate combo | < 50ms | Codex `linux-sandbox` crate (Apache-2.0, code reading reference) |
-| macOS | `sandbox_init()` direct call via `nix`/`libc` crate, dynamic TinyScheme profile generation | < 50ms | MXC `seatbelt_common` crate design (MIT, design blueprint); NOT calling `sandbox-exec` CLI to avoid external binary dependency |
-| Windows | `windows` crate AppContainer API | native | MXC `appcontainer_common` reference |
+| Platform | Backend | Reference |
+|---|---|---|
+| Linux | `landlock` + `libseccomp` crate combo | Codex `linux-sandbox` (Apache-2.0, code reading) |
+| macOS | `sandbox_init()` direct call | MXC `seatbelt_common` design blueprint |
+| Windows | AppContainer API | MXC `appcontainer_common` reference |
 
-**Key design decisions**:
-- **macOS does NOT call `sandbox-exec` CLI** — directly uses `sandbox_init()` in `Command::pre_exec` (MXC's approach, more robust, avoids external binary dependency)
-- **Linux uses crate combination not vendoring** — `landlock` 0.4.5 (11.2M downloads, MIT/Apache-2.0) + `libseccomp` 0.4.0 (1.66M downloads) already do the heavy lifting; no need to vendor Codex's entire `linux-sandbox` crate
-- **Network isolation** (Phase 4): reference ASRT's proxy model (HTTP proxy + SOCKS5 + domain allowlist), simplified to "all deny + allowlist domains" local proxy in Phase 1-2
-
-### BPF as optional Linux observability layer (Phase 3+)
+### BPF as optional Linux observability layer (Phase 5+)
 
 Not the default backend. Role: observability / audit / advanced enforcement. Integration method: detect if Tetragon/Tracee daemon is running; if so, register policy via its API; lim itself does not load BPF programs. Use `matchNamespaces` (not `matchBinaries`, to avoid shebang trap) for process-tree filtering.
 
@@ -212,9 +232,10 @@ Not the main sandbox. Reserved for "user uploads .wasm tool plug-and-play" scena
 
 **Architecture relationship**:
 ```
-L0 policy (current policy.rs)  →  L1 OS sandbox (lim-sandbox: bwrap/Seatbelt/Landlock)  →  L2 optional Wasm plugin runtime (future)
+L0 policy (current policy.rs)  →  L1 OS sandbox (MXC or self-built)  →  L2 optional Wasm plugin runtime (future)
+                                    ↑
+                       BPF observability（Linux 可选，Phase 5+）
 ```
-Wasm is L2 extension layer, orthogonal to L1. If lim doesn't accept user .wasm plugins, pure OS sandbox suffices, no double layer needed.
 
 ## System Prompt Layer (3-layer persistence)
 
