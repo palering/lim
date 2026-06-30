@@ -369,7 +369,22 @@ This design draws from:
 
 ## Open Questions
 
+### Decided (2026-06-30)
+
+- [x] **`ToolCategory` bitflag?** — **No.** Use single `enum ToolCategory` with default `ReadOnly`; tools override via `Tool::category()` as needed. No real multi-category scenarios exist for lim's tools (read/ls/grep=ReadOnly, write/edit=Write, bash=Script, fetch=Network). ApprovalMode decision semantics stay clear with single category. If finer control needed later (e.g. "which bash commands are read-only"), that's command-level matching (`is_known_safe_command` style), not category-level bitflag. No mainstream agent uses bitflag (Codex/Claude Code/Trae all use tool-name allowlist/denylist or string matching). YAGNI.
+
+- [x] **Cross-workspace git operations?** — **Two-step approach, conservative first.**
+  - **Phase 1 (current)**: Simple `detect_external_git_path(cmd, workspace_roots)` string match for `git -C <token>`, check path prefix. ~30 lines in `DefaultPolicy::check_command`. Any `git -C /external/path` triggers prompt (regardless of read/write subcommand) — false positive cost (one prompt) << false negative cost (agent modifies external repo).
+  - **Phase 2+ (future)**: Precise git subcommand parsing — read-only (`status`/`log`/`diff`/`show`/`branch`) allowed cross-workspace; write (`push`/`reset`/`commit`/`config`) checked against workspace_roots. Needs command parser, defer.
+  - Special cases: `git config --global` → blocklist; `git clone <url>` → network prompt; `git -C /tmp` → external prompt.
+  - Principle: conservative first. Cross-workspace git ops are rarely necessary.
+
+- [x] **Compaction + `<system-reminder>` preservation?** — **Preserve info, not tags.**
+  - `<system-reminder>` is transport, not content. Compaction may drop tags.
+  - **Implementation**: `ContextWindowManager::compact()` appends a new `<system-reminder>` at the end of compacted messages, containing current workspace + trust level. This ensures the structured values (workspace path, trust level) are present in compacted context.
+  - **Why not Codex's `encrypted_content`**: Codex lets model preserve "latent understanding" (tone, emphasis, reasoning path). But lim's key directives are **structured values** (workspace path, trust level) — don't need model to "understand", just need the values correct. Re-injection is more reliable than model memory.
+  - **Risk coverage**: user switches `/trust` mid-session → new `<system-reminder>` reflects new value; user changes workspace_roots → same; even if L1+L2 both fail (theoretical), L3 tool hard constraint still holds.
+
+### Still open
+
 - [ ] Should `novel-cli` and `lim` share the same trust config, or does each pack have its own? Leaning toward shared (trust is runtime-level, not domain-level).
-- [ ] How to handle `git` operations that span workspaces (e.g. `git -C /other/repo`)? Block by default, allow via explicit `writable_roots`?
-- [ ] Should `ToolCategory` be a bitflag (so a tool can be `Write | Network`)? Leaning toward single category for simplicity; tools declare their primary category.
-- [ ] Does compaction need to preserve `<system-reminder>` tags verbatim, or just the workspace/trust info? Leaning toward preserving the info (tags are transport, not content).

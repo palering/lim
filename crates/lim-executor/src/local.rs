@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -13,7 +13,9 @@ use crate::policy::{DefaultPolicy, PermissionPolicy};
 
 /// Local executor — runs file operations and commands on the host machine.
 ///
-/// Phase 1 implementation with L0 permission policy.
+/// Phase 1 implementation with L0 permission policy. For production use,
+/// prefer `LocalExecutor::workspace(roots)`; `permissive()` is deprecated
+/// and should only be used in tests.
 pub struct LocalExecutor {
     policy: Arc<DefaultPolicy>,
 }
@@ -26,7 +28,22 @@ impl LocalExecutor {
         }
     }
 
-    /// Create a permissive local executor (for testing).
+    /// Create a workspace-scoped local executor.
+    ///
+    /// This is the recommended production constructor: paths are restricted
+    /// to `workspace_roots`, dangerous commands are blocked, and
+    /// cross-workspace `git -C` is rejected.
+    ///
+    /// See docs/draft/trust-and-approval.md for the full trust model.
+    pub fn workspace(workspace_roots: Vec<Utf8PathBuf>) -> Self {
+        Self::new(DefaultPolicy::new(workspace_roots))
+    }
+
+    /// Create a permissive local executor (allows everything).
+    ///
+    /// Deprecated for production use — prefer `LocalExecutor::workspace(vec![cwd])`.
+    #[deprecated(note = "permissive executor allows everything; use `workspace(vec![root])` for production")]
+    #[allow(deprecated)]
     pub fn permissive() -> Self {
         Self::new(DefaultPolicy::permissive())
     }
@@ -317,6 +334,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn test_executor() -> LocalExecutor {
+        #[allow(deprecated)]
         LocalExecutor::permissive()
     }
 

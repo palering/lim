@@ -70,6 +70,13 @@ enum Commands {
         /// the new turn's assistant responses.
         #[arg(long)]
         resume: Option<Utf8PathBuf>,
+
+        /// Trust level: `workspace` (default, restricts file/command access
+        /// to the project dir) or `permissive` (allows everything, dangerous).
+        ///
+        /// See docs/draft/trust-and-approval.md for the full trust model.
+        #[arg(long, default_value = "workspace")]
+        trust: TrustArg,
     },
 
     /// Launch the interactive TUI (terminal user interface).
@@ -85,6 +92,10 @@ enum Commands {
         /// Model name to request. Overrides the provider's `default_model`.
         #[arg(long)]
         model: Option<String>,
+
+        /// Trust level: `workspace` (default) or `permissive`.
+        #[arg(long, default_value = "workspace")]
+        trust: TrustArg,
     },
 
     /// List configured providers from `.lim/config.toml`.
@@ -128,6 +139,65 @@ enum FixtureEntry {
         text: Option<String>,
         calls: Vec<FixtureToolCall>,
     },
+}
+
+/// CLI trust level argument.
+///
+/// - `workspace` (default): restrict file access to the project directory,
+///   block dangerous commands, reject cross-workspace `git -C`.
+/// - `permissive`: allow everything (dangerous, for testing only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TrustArg {
+    #[value(name = "workspace")]
+    Workspace,
+    #[value(name = "permissive")]
+    Permissive,
+}
+
+impl TrustArg {
+    fn is_permissive(self) -> bool {
+        matches!(self, Self::Permissive)
+    }
+}
+
+/// Resolve workspace roots: git root if available, else current dir.
+///
+/// See docs/draft/trust-and-approval.md "workspace_roots resolution".
+fn resolve_workspace_roots() -> Utf8PathBuf {
+    // Try git root first
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let trimmed = s.trim();
+        if !trimmed.is_empty()
+            && let Ok(p) = Utf8PathBuf::from_path_buf(std::path::PathBuf::from(trimmed))
+        {
+            return p;
+        }
+    }
+    // Fallback to current dir
+    Utf8PathBuf::from(".")
+}
+
+/// Build a `LocalExecutor` based on the trust argument.
+///
+/// `workspace`: restrict to resolved workspace roots.
+/// `permissive`: allow everything, print a warning to stderr.
+fn build_executor(trust: TrustArg) -> Arc<LocalExecutor> {
+    if trust.is_permissive() {
+        eprintln!("⚠ WARNING: running in permissive trust mode — no file/command restrictions.");
+        eprintln!("  Use `--trust workspace` (default) for production.");
+        #[allow(deprecated)]
+        Arc::new(LocalExecutor::permissive())
+    } else {
+        let root = resolve_workspace_roots();
+        eprintln!("Trust: workspace (root: {root})");
+        Arc::new(LocalExecutor::workspace(vec![root]))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,11 +258,16 @@ async fn main() -> anyhow::Result<()> {
             message,
             output,
             resume,
+            trust,
         } => {
-            run_session(provider, model, fake, resume, message, output).await?;
+            run_session(provider, model, fake, resume, message, output, trust).await?;
         }
-        Commands::Tui { provider, model } => {
-            run_tui(provider, model).await?;
+        Commands::Tui {
+            provider,
+            model,
+            trust,
+        } => {
+            run_tui(provider, model, trust).await?;
         }
         Commands::Providers => {
             list_providers();
@@ -275,6 +350,7 @@ async fn run_session(
     resume: Option<Utf8PathBuf>,
     user_message: String,
     output_path: Option<Utf8PathBuf>,
+    trust: TrustArg,
 ) -> Result<()> {
     // If resuming, load prior session events and replay messages + edits.
     // prior_messages will be prepended to the new turn's context.
@@ -327,7 +403,7 @@ async fn run_session(
     }
 
     // Create executor and tool registry
-    let executor = Arc::new(LocalExecutor::permissive());
+    let executor = build_executor(trust);
     let mut registry = ToolRegistry::new();
     lim_tools::register_builtins(&mut registry, executor);
     let registry = Arc::new(registry);
@@ -486,6 +562,7 @@ fn chrono_lite_timestamp() -> String {
 async fn run_tui(
     cli_provider: Option<String>,
     cli_model: Option<String>,
+    trust: TrustArg,
 ) -> Result<()> {
     // Resolve provider + model from config
     let config = LimConfig::load_from_default_path();
@@ -504,7 +581,7 @@ async fn run_tui(
         .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
 
     // Create executor and tool registry
-    let executor = Arc::new(LocalExecutor::permissive());
+    let executor = build_executor(trust);
     let mut registry = ToolRegistry::new();
     lim_tools::register_builtins(&mut registry, executor);
     let registry = Arc::new(registry);
