@@ -33,11 +33,13 @@ lim/
 |-----------|---------|
 | `archive/` | Completed phase details — technical decisions, patterns established, acceptance criteria. Only contains work that is DONE. |
 | `draft/` | Design drafts and unconfirmed ideas — not committed to any phase. May evolve into planned work or be discarded. |
+| `research/` | External landscape research — technology surveys of other tools, technical mechanism analyses. Reference material for design decisions. |
 | `review/` | Code/implementation reviews — quality assessments and findings from review sessions. |
 
 ## Files
 
 - [architecture.md](architecture.md) — Confirmed architectural decisions: frontend/library boundary, directory structure, library exportability.
+- [packaging-plan.md](packaging-plan.md) — Cross-platform packaging & distribution plan (Phase A baseline binaries → Phase B package managers → Phase C self-update).
 
 ### archive/
 
@@ -48,6 +50,12 @@ lim/
 - [first-draft.md](draft/first-draft.md) — Initial design draft.
 - [second-draft.md](draft/second-draft.md) — Revised design draft.
 - [library-polish.md](draft/library-polish.md) — Ideas for external API hardening (ProviderFactory, SessionManager, WorkflowContext typed channels). Not confirmed for implementation.
+- [trust-and-approval.md](draft/trust-and-approval.md) — Trust levels + ApprovalMode (5 tiers) + sandbox architecture design. Decouples Executor/Sandbox into separate crates with feature-gated policy. References Codex/Claude Code/Trae/Goose/MXC/LiteBox.
+
+### research/
+
+- [agent-sandbox-landscape.md](research/agent-sandbox-landscape.md) — 2025-2026 survey of sandbox mechanisms across Codex/Claude Code/Trae/Qoder/Cursor/Aider/Goose/OpenHands/Devin/Roo Code. Covers Landlock/bwrap/Seatbelt/microVM/Wasm + Microsoft MXC/LiteBox.
+- [system-prompt-persistence.md](research/system-prompt-persistence.md) — How agents keep system prompt instructions effective: per-turn resend + prompt caching, message-layer `<system-reminder>`, tool-layer hard constraints. Claude Code 10-step assembly + Codex 5-layer injection.
 
 ### review/
 
