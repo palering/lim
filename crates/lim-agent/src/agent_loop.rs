@@ -866,7 +866,7 @@ mod tests {
         assert_eq!(messages[1].role, Role::Assistant);
         assert!(messages[1].has_tool_calls());
         assert_eq!(messages[2].role, Role::Tool);
-        assert!(!messages[2].content[0].as_tool_call().is_some()); // Tool messages are text, not tool calls
+        assert!(messages[2].content[0].as_tool_call().is_none()); // Tool messages are text, not tool calls
         assert_eq!(messages[3].role, Role::Assistant);
 
         // Verify events were emitted
