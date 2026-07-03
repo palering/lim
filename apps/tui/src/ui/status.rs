@@ -3,35 +3,28 @@
 //! Line 1: busy indicator · turn count · approval mode · status message
 //! Line 2: total tokens · current turn tokens · context window usage
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::app::App;
 
+/// Render the status bar with operational state and token usage.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // ── Line 1: operational state ──
     let mut line1: Vec<Span> = Vec::new();
 
     if app.agent_busy() {
-        line1.push(Span::styled(
-            " ⟳ working ",
-            Style::default().fg(Color::Yellow),
-        ));
+        line1.push(Span::styled(" ⟳ working ", Style::default().fg(Color::Yellow)));
     } else {
-        line1.push(Span::styled(
-            " ● ready ",
-            Style::default().fg(Color::Green),
-        ));
+        line1.push(Span::styled(" ● ready ", Style::default().fg(Color::Green)));
     }
 
     line1.push(Span::raw("· "));
-    line1.push(Span::styled(
-        format!("turn {}", app.turn_count()),
-        Style::default().fg(Color::Cyan),
-    ));
+    line1
+        .push(Span::styled(format!("turn {}", app.turn_count()), Style::default().fg(Color::Cyan)));
 
     line1.push(Span::raw("  ·  "));
     line1.push(Span::styled(
@@ -48,10 +41,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let mut line2: Vec<Span> = Vec::new();
 
     // Total tokens (cumulative across all turns)
-    line2.push(Span::styled(
-        "total ",
-        Style::default().fg(Color::DarkGray),
-    ));
+    line2.push(Span::styled("total ", Style::default().fg(Color::DarkGray)));
     line2.push(Span::styled(
         format!(
             "{}↑ {}↓",

@@ -34,9 +34,7 @@ pub fn build_chapter_workflow(
 
         let writer_prompt_fn: Arc<
             dyn Fn(&serde_json::Value, Option<&str>) -> String + Send + Sync,
-        > = Arc::new(move |_input, feedback| {
-            writer::build_writer_prompt(&scene_json, feedback)
-        });
+        > = Arc::new(move |_input, feedback| writer::build_writer_prompt(&scene_json, feedback));
 
         let reviewer_prompt_fn: Arc<dyn Fn(&serde_json::Value) -> String + Send + Sync> =
             Arc::new(reviewer::build_reviewer_prompt);
@@ -62,7 +60,7 @@ pub fn build_chapter_workflow(
             // Collect all scene draft outputs from context
             let mut drafts = Vec::new();
             for scene_id in &scene_ids_for_editor {
-                if let Some(NodeOutput::Data(v)) = ctx.get_output(scene_id).as_ref() {
+                if let Some(NodeOutput::Data(v)) = ctx.output(scene_id).as_ref() {
                     drafts.push(v.clone());
                 }
             }
@@ -81,25 +79,18 @@ pub fn build_chapter_workflow(
 
     // 3. Create the Chapter transform node (stores final output as data)
     let chapter_number = chapter_outline.chapter_number;
-    let chapter_transform: Arc<
-        dyn Fn(&WorkflowContext, &NodeOutput) -> NodeOutput + Send + Sync,
-    > = Arc::new(move |_ctx, editor_output| {
-        let chapter_text = editor_output
-            .extract_text()
-            .unwrap_or_else(|| "[empty chapter]".to_string());
+    let chapter_transform: Arc<dyn Fn(&WorkflowContext, &NodeOutput) -> NodeOutput + Send + Sync> =
+        Arc::new(move |_ctx, editor_output| {
+            let chapter_text =
+                editor_output.extract_text().unwrap_or_else(|| "[empty chapter]".to_string());
 
-        NodeOutput::Data(serde_json::json!({
-            "chapter_number": chapter_number,
-            "text": chapter_text,
-        }))
-    });
+            NodeOutput::Data(serde_json::json!({
+                "chapter_number": chapter_number,
+                "text": chapter_text,
+            }))
+        });
 
-    graph.add_node(Node::new(
-        "chapter",
-        NodeKind::Transform {
-            transform: chapter_transform,
-        },
-    ));
+    graph.add_node(Node::new("chapter", NodeKind::Transform { transform: chapter_transform }));
 
     // 4. Add edges
     // All scene loops → editor (fan-in)

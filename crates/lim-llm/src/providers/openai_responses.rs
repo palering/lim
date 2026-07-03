@@ -45,6 +45,7 @@ pub struct OpenAiResponsesProvider {
 }
 
 impl OpenAiResponsesProvider {
+    /// Create a new provider with the given API key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -55,6 +56,7 @@ impl OpenAiResponsesProvider {
         }
     }
 
+    /// Set the base URL (the `/v1/responses` suffix is appended automatically).
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
@@ -70,6 +72,7 @@ impl OpenAiResponsesProvider {
         self
     }
 
+    /// Add extra HTTP headers to every request (e.g. for proxy auth).
     pub fn with_extra_headers(mut self, headers: HashMap<String, String>) -> Self {
         self.extra_headers = headers;
         self
@@ -85,11 +88,8 @@ impl OpenAiResponsesProvider {
 
     fn build_request_body(&self, request: &LlmRequest) -> serde_json::Value {
         // Convert messages to ResponseItem input array
-        let input: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .filter_map(convert_message_to_input_item)
-            .collect();
+        let input: Vec<serde_json::Value> =
+            request.messages.iter().filter_map(convert_message_to_input_item).collect();
 
         let mut body = serde_json::json!({
             "model": request.model,
@@ -102,11 +102,8 @@ impl OpenAiResponsesProvider {
         }
 
         if !request.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(convert_tool_schema)
-                .collect();
+            let tools: Vec<serde_json::Value> =
+                request.tools.iter().map(convert_tool_schema).collect();
             body["tools"] = serde_json::Value::Array(tools);
         }
 
@@ -132,6 +129,10 @@ impl Provider for OpenAiResponsesProvider {
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
+            let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            tracing::debug!(url = %url, model = %model, "openai responses: sending request");
+            tracing::trace!(body = ?body, "openai responses request body");
+
             let mut req_builder = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {api_key}"))
@@ -153,16 +154,26 @@ impl Provider for OpenAiResponsesProvider {
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let text = response.text().await.unwrap_or_default();
+                tracing::debug!(status, body = %text, "openai responses: HTTP error response");
                 let _ = tx.send(Err(classify_http_error(status, &text))).await;
                 return;
             }
 
+            tracing::debug!(
+                status = response.status().as_u16(),
+                "openai responses: stream started"
+            );
             let mut state = ResponsesStreamState::default();
             let mut stream = sse_event_stream(response);
 
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(event) => {
+                        tracing::trace!(
+                            event_type = %event.event,
+                            data_len = event.data.len(),
+                            "openai responses SSE event"
+                        );
                         // Detect provider/proxy errors embedded as SSE
                         // events (HTTP 200 + error event). Without this,
                         // malformed streams would be silently dropped as
@@ -229,13 +240,17 @@ impl ResponsesStreamState {
 
         let payload: serde_json::Value = match serde_json::from_str(data) {
             Ok(v) => v,
-            Err(_) => return vec![],
+            Err(e) => {
+                tracing::warn!(
+                    data_len = data.len(),
+                    error = %e,
+                    "openai responses SSE: failed to parse JSON payload, dropping event"
+                );
+                return vec![];
+            }
         };
 
-        let event_type = payload
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let event_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match event_type {
             "response.created" => {
@@ -244,35 +259,23 @@ impl ResponsesStreamState {
             }
             "response.output_text.delta" => {
                 let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                vec![StreamEvent::TextDelta {
-                    text: delta.to_string(),
-                }]
+                vec![StreamEvent::TextDelta { text: delta.to_string() }]
             }
             "response.reasoning_summary_text.delta" => {
                 let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                vec![StreamEvent::ThinkingDelta {
-                    text: delta.to_string(),
-                }]
+                vec![StreamEvent::ThinkingDelta { text: delta.to_string() }]
             }
             "response.reasoning_text.delta" => {
                 let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                vec![StreamEvent::ThinkingDelta {
-                    text: delta.to_string(),
-                }]
+                vec![StreamEvent::ThinkingDelta { text: delta.to_string() }]
             }
             "response.output_item.added" => {
                 // A new output item is starting. If it's a function_call, emit ToolCallStart.
                 if let Some(item) = payload.get("item") {
                     if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                        let call_id = item
-                            .get("call_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = item
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
+                        let call_id =
+                            item.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = item.get("name").and_then(|v| v.as_str()).map(String::from);
                         // Preserve the provider-supplied call_id (e.g.
                         // "call_123") so that subsequent tool_result messages
                         // can echo it back verbatim. Fall back to a generated
@@ -296,11 +299,8 @@ impl ResponsesStreamState {
                 // as a single ToolCallDelta (no accumulation needed).
                 if let Some(item) = payload.get("item") {
                     if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                        let call_id = item
-                            .get("call_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        let call_id =
+                            item.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let arguments = item
                             .get("arguments")
                             .and_then(|v| v.as_str())
@@ -308,17 +308,11 @@ impl ResponsesStreamState {
                             .to_string();
 
                         if let Some(id) = self.items.remove(&call_id) {
-                            vec![StreamEvent::ToolCallDelta {
-                                id,
-                                arguments_delta: arguments,
-                            }]
+                            vec![StreamEvent::ToolCallDelta { id, arguments_delta: arguments }]
                         } else {
                             // Item was not tracked (no added event); create and emit
                             let id = ToolCallId::new();
-                            vec![StreamEvent::ToolCallDelta {
-                                id,
-                                arguments_delta: arguments,
-                            }]
+                            vec![StreamEvent::ToolCallDelta { id, arguments_delta: arguments }]
                         }
                     } else {
                         vec![]
@@ -332,14 +326,8 @@ impl ResponsesStreamState {
 
                 // Extract usage
                 if let Some(usage) = payload.get("response").and_then(|r| r.get("usage")) {
-                    let input = usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let output = usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                    let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     events.push(StreamEvent::Usage(Usage::new(input, output)));
                 }
 
@@ -353,9 +341,7 @@ impl ResponsesStreamState {
                     "incomplete" => StopReason::MaxTokens,
                     _ => StopReason::EndTurn,
                 };
-                events.push(StreamEvent::Done {
-                    stop_reason: reason,
-                });
+                events.push(StreamEvent::Done { stop_reason: reason });
 
                 events
             }
@@ -367,9 +353,7 @@ impl ResponsesStreamState {
 fn classify_http_error(status: u16, body: &str) -> ProviderError {
     match status {
         401 | 403 => ProviderError::Auth(body.to_string()),
-        429 => ProviderError::RateLimited {
-            retry_after_ms: None,
-        },
+        429 => ProviderError::RateLimited { retry_after_ms: None },
         400 => {
             if body.contains("context_length") || body.contains("context window") {
                 ProviderError::ContextWindowExceeded
@@ -379,10 +363,7 @@ fn classify_http_error(status: u16, body: &str) -> ProviderError {
         }
         402 => ProviderError::QuotaExceeded,
         502 | 503 => ProviderError::ServerOverloaded,
-        _ => ProviderError::Api {
-            status,
-            message: body.to_string(),
-        },
+        _ => ProviderError::Api { status, message: body.to_string() },
     }
 }
 
@@ -411,11 +392,7 @@ fn convert_message_to_input_item(msg: &lim_core::message::LlmMessage) -> Option<
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => Some(serde_json::json!({
+                    ContentBlock::ToolCall { id, name, arguments } => Some(serde_json::json!({
                         "type": "function_call",
                         "call_id": id.to_string(),
                         "name": name,
@@ -439,11 +416,7 @@ fn convert_message_to_input_item(msg: &lim_core::message::LlmMessage) -> Option<
         }
         Role::Tool => {
             let text = extract_text(&msg.content);
-            let call_id = msg
-                .tool_call_ids
-                .first()
-                .map(|id| id.to_string())
-                .unwrap_or_default();
+            let call_id = msg.tool_call_ids.first().map(|id| id.to_string()).unwrap_or_default();
 
             Some(serde_json::json!({
                 "type": "function_call_output",
@@ -491,9 +464,7 @@ mod tests {
     #[test]
     fn parse_text_delta() {
         let mut state = ResponsesStreamState::default();
-        let ev = make_event(
-            r#"{"type":"response.output_text.delta","delta":"Hello"}"#,
-        );
+        let ev = make_event(r#"{"type":"response.output_text.delta","delta":"Hello"}"#);
         let events = state.parse_event(&ev);
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -505,9 +476,7 @@ mod tests {
     #[test]
     fn parse_reasoning_delta() {
         let mut state = ResponsesStreamState::default();
-        let ev = make_event(
-            r#"{"type":"response.reasoning_summary_text.delta","delta":"hmm"}"#,
-        );
+        let ev = make_event(r#"{"type":"response.reasoning_summary_text.delta","delta":"hmm"}"#);
         let events = state.parse_event(&ev);
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -598,9 +567,11 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::Usage(usage) if usage.input_tokens == 100 && usage.output_tokens == 50)));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::Done { stop_reason: StopReason::EndTurn })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Done { stop_reason: StopReason::EndTurn }))
+        );
     }
 
     // --- endpoint() resolution tests ---
@@ -613,22 +584,16 @@ mod tests {
 
     #[test]
     fn endpoint_falls_back_to_base_url_suffix() {
-        let p = OpenAiResponsesProvider::new("key")
-            .with_base_url("https://custom.openai-proxy.com");
-        assert_eq!(
-            p.endpoint(),
-            "https://custom.openai-proxy.com/v1/responses"
-        );
+        let p =
+            OpenAiResponsesProvider::new("key").with_base_url("https://custom.openai-proxy.com");
+        assert_eq!(p.endpoint(), "https://custom.openai-proxy.com/v1/responses");
     }
 
     #[test]
     fn endpoint_uses_full_url_when_set() {
         let p = OpenAiResponsesProvider::new("key")
             .with_full_url("https://proxy.example.com/responses/v2?api-version=2024");
-        assert_eq!(
-            p.endpoint(),
-            "https://proxy.example.com/responses/v2?api-version=2024"
-        );
+        assert_eq!(p.endpoint(), "https://proxy.example.com/responses/v2?api-version=2024");
     }
 
     #[test]

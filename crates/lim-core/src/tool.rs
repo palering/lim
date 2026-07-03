@@ -36,7 +36,7 @@ impl ToolCategory {
 /// generate valid tool calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSchema {
-    /// Tool name (unique identifier, e.g. "bash", "read", "write").
+    /// Tool name (unique identifier, e.g. "shell", "read", "write").
     pub name: String,
     /// Human-readable description of what the tool does.
     pub description: String,
@@ -52,11 +52,7 @@ impl ToolSchema {
         description: impl Into<String>,
         parameters: serde_json::Value,
     ) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-            parameters,
-        }
+        Self { name: name.into(), description: description.into(), parameters }
     }
 }
 
@@ -75,11 +71,7 @@ pub struct ToolCall {
 impl ToolCall {
     /// Create a new tool call.
     pub fn new(id: ToolCallId, name: impl Into<String>, arguments: serde_json::Value) -> Self {
-        Self {
-            id,
-            name: name.into(),
-            arguments,
-        }
+        Self { id, name: name.into(), arguments }
     }
 }
 
@@ -97,20 +89,12 @@ pub struct ToolResult {
 impl ToolResult {
     /// Create a successful tool result.
     pub fn success(tool_call_id: ToolCallId, output: impl Into<String>) -> Self {
-        Self {
-            tool_call_id,
-            output: output.into(),
-            is_error: false,
-        }
+        Self { tool_call_id, output: output.into(), is_error: false }
     }
 
     /// Create an error tool result.
     pub fn error(tool_call_id: ToolCallId, output: impl Into<String>) -> Self {
-        Self {
-            tool_call_id,
-            output: output.into(),
-            is_error: true,
-        }
+        Self { tool_call_id, output: output.into(), is_error: true }
     }
 }
 

@@ -4,9 +4,9 @@
 //! into a stream of SSE events (with `data:` prefix and `[DONE]` handling
 //! already done by `eventsource-stream`).
 
+use eventsource_stream::Event;
 use eventsource_stream::Eventsource;
 use futures::stream::{BoxStream, StreamExt};
-use eventsource_stream::Event;
 
 use crate::error::ProviderError;
 
@@ -23,9 +23,7 @@ pub fn sse_event_stream(
     response
         .bytes_stream()
         .eventsource()
-        .map(|result| {
-            result.map_err(|e| ProviderError::Stream(format!("SSE parse error: {e}")))
-        })
+        .map(|result| result.map_err(|e| ProviderError::Stream(format!("SSE parse error: {e}"))))
         .boxed()
 }
 
@@ -59,10 +57,7 @@ pub fn try_extract_error(event: &Event) -> Option<ProviderError> {
             .and_then(|v| v.as_str())
             .or_else(|| payload.get("message").and_then(|v| v.as_str()))
             .unwrap_or("unknown streaming error");
-        return Some(ProviderError::Api {
-            status: 0,
-            message: msg.to_string(),
-        });
+        return Some(ProviderError::Api { status: 0, message: msg.to_string() });
     }
 
     // Shape 2: no `event:` field, but the JSON payload has a top-level
@@ -87,10 +82,7 @@ pub fn try_extract_error(event: &Event) -> Option<ProviderError> {
                 .or_else(|| error.get("type").and_then(|v| v.as_str()))
                 .or_else(|| error.get("code").and_then(|v| v.as_str()))
                 .unwrap_or("unknown streaming error");
-            return Some(ProviderError::Api {
-                status: 0,
-                message: msg.to_string(),
-            });
+            return Some(ProviderError::Api { status: 0, message: msg.to_string() });
         }
     }
 
@@ -168,19 +160,13 @@ mod tests {
 
     #[test]
     fn does_not_flag_normal_responses_output_text_delta() {
-        let ev = make_event(
-            "message",
-            r#"{"type":"response.output_text.delta","delta":"hello"}"#,
-        );
+        let ev = make_event("message", r#"{"type":"response.output_text.delta","delta":"hello"}"#);
         assert!(try_extract_error(&ev).is_none());
     }
 
     #[test]
     fn does_not_flag_chat_completions_chunk() {
-        let ev = make_event(
-            "message",
-            r#"{"choices":[{"delta":{"content":"hi"},"index":0}]}"#,
-        );
+        let ev = make_event("message", r#"{"choices":[{"delta":{"content":"hi"},"index":0}]}"#);
         assert!(try_extract_error(&ev).is_none());
     }
 

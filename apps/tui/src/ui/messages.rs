@@ -7,17 +7,18 @@
 //!
 //! The streaming message (if any) is rendered at the bottom with a cursor block.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use lim_core::content::ContentBlock;
 use lim_core::message::{AgentMessage, Role};
 
 use crate::app::{App, ToolCallStatus};
 
+/// Render the conversation history and any in-progress streaming message.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::NONE);
     frame.render_widget(block, area);
@@ -81,18 +82,13 @@ fn render_message(lines: &mut Vec<Line>, msg: &AgentMessage, app: &App) {
         Role::System => ("system", Color::DarkGray),
     };
 
-    let label_span = Span::styled(
-        format!("{label} "),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    );
+    let label_span =
+        Span::styled(format!("{label} "), Style::default().fg(color).add_modifier(Modifier::BOLD));
 
     // For user messages, render text inline
     if msg.role == Role::User {
         let text = extract_text(&msg.content);
-        lines.push(Line::from(vec![
-            label_span,
-            Span::raw(text),
-        ]));
+        lines.push(Line::from(vec![label_span, Span::raw(text)]));
         return;
     }
 
@@ -104,10 +100,7 @@ fn render_message(lines: &mut Vec<Line>, msg: &AgentMessage, app: &App) {
                 lines.push(Line::from(vec![label_span.clone(), text_span]));
             }
             ContentBlock::Thinking { text } => {
-                let think_label = Span::styled(
-                    "  thinking: ",
-                    Style::default().fg(Color::Magenta),
-                );
+                let think_label = Span::styled("  thinking: ", Style::default().fg(Color::Magenta));
                 let text_span = Span::styled(text.clone(), Style::default().fg(Color::DarkGray));
                 lines.push(Line::from(vec![think_label, text_span]));
             }
@@ -159,10 +152,7 @@ fn render_tool_card(
         _ => Color::DarkGray,
     };
 
-    let icon = Span::styled(
-        format!("  ▸ {name}"),
-        Style::default().fg(Color::Cyan),
-    );
+    let icon = Span::styled(format!("  ▸ {name}"), Style::default().fg(Color::Cyan));
     let status = Span::styled(format!(" [{status_str}]"), Style::default().fg(status_color));
 
     // Truncate arguments for display
@@ -181,29 +171,31 @@ fn render_tool_card(
 
     // If done, show output preview (first 3 lines) or full output if expanded
     if let Some(tc) = tc_display
-        && tc.status == ToolCallStatus::Done && !tc.output.is_empty() {
-            let is_expanded = app.is_tool_expanded(id);
-            if is_expanded {
-                // Show full output
-                for line in tc.output.lines() {
-                    lines.push(Line::from(format!("  │ {line}")));
-                }
-                lines.push(Line::from("  └─ [press e to collapse]"));
+        && tc.status == ToolCallStatus::Done
+        && !tc.output.is_empty()
+    {
+        let is_expanded = app.is_tool_expanded(id);
+        if is_expanded {
+            // Show full output
+            for line in tc.output.lines() {
+                lines.push(Line::from(format!("  │ {line}")));
+            }
+            lines.push(Line::from("  └─ [press e to collapse]"));
+        } else {
+            // Show 3-line preview
+            let output_preview: String = tc.output.lines().take(3).collect::<Vec<_>>().join("\n");
+            let total_lines = tc.output.lines().count();
+            let suffix = if total_lines > 3 {
+                format!("\n  ... ({} more lines, press e to expand)", total_lines - 3)
             } else {
-                // Show 3-line preview
-                let output_preview: String = tc.output.lines().take(3).collect::<Vec<_>>().join("\n");
-                let total_lines = tc.output.lines().count();
-                let suffix = if total_lines > 3 {
-                    format!("\n  ... ({} more lines, press e to expand)", total_lines - 3)
-                } else {
-                    String::new()
-                };
-                let out_text = format!("  │ {output_preview}{suffix}");
-                for line in out_text.lines() {
-                    lines.push(Line::from(line.to_string()));
-                }
+                String::new()
+            };
+            let out_text = format!("  │ {output_preview}{suffix}");
+            for line in out_text.lines() {
+                lines.push(Line::from(line.to_string()));
             }
         }
+    }
 }
 
 fn extract_text(content: &[ContentBlock]) -> String {

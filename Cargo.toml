@@ -2,9 +2,11 @@
 resolver = "3"
 members = [
     "crates/lim-core",
+    "crates/lim-config",
     "crates/lim-llm",
     "crates/lim-agent",
     "crates/lim-executor",
+    "crates/lim-skills",
     "crates/lim-tools",
     "crates/lim-session",
     "crates/lim-workflow",
@@ -16,17 +18,19 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/user/lim"
+repository = "https://github.com/palering/lim"
 
 [workspace.dependencies]
 # Internal crates
 lim-core = { path = "crates/lim-core" }
+lim-config = { path = "crates/lim-config" }
 lim-llm = { path = "crates/lim-llm" }
 lim-agent = { path = "crates/lim-agent" }
 lim-executor = { path = "crates/lim-executor" }
 lim-tools = { path = "crates/lim-tools" }
 lim-session = { path = "crates/lim-session" }
 lim-workflow = { path = "crates/lim-workflow" }
+lim-skills = { path = "crates/lim-skills" }
 lim-tui = { path = "apps/tui" }
 novel-pack = { path = "packs/novel" }
 
@@ -57,6 +61,9 @@ schemars = "0.8"
 # Async streams
 futures = "0.3"
 
+# Async trait
+async-trait = "0.1"
+
 # Schema validation
 jsonschema = "0.30"
 
@@ -84,3 +91,15 @@ toml = "0.8"
 # TUI
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+
+[profile.release]
+# Reduce binary size and enable cross-module optimization.
+# Trade-off: slower build (~2-3x), but smaller + faster runtime binary.
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# Faster dev iteration — keep debug info but skip optimizations.
+[profile.dev]
+debug = 1

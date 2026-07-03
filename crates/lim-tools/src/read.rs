@@ -14,6 +14,7 @@ pub struct ReadFileTool {
 }
 
 impl ReadFileTool {
+    /// Create a new [`ReadFileTool`] backed by the given executor.
     pub fn new(executor: Arc<dyn Executor>) -> Self {
         Self { executor }
     }
@@ -49,13 +50,9 @@ impl Tool for ReadFileTool {
     ) -> ToolFuture<Result<ToolResult>> {
         let executor = Arc::clone(&self.executor);
         Box::pin(async move {
-            let path_str = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| LimError::ToolExecution {
-                    name: "read".to_string(),
-                    message: "missing required argument: path".to_string(),
-                })?;
+            let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                LimError::tool_execution_msg("read", "missing required argument: path")
+            })?;
 
             let path = Utf8PathBuf::from(path_str);
             let bytes = executor.read_file(&path).await?;

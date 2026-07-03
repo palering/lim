@@ -19,23 +19,13 @@ impl Usage {
     /// Create a new usage with the given token counts.
     pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
         let total_tokens = input_tokens + output_tokens;
-        Self {
-            input_tokens,
-            output_tokens,
-            cached_tokens: 0,
-            total_tokens,
-        }
+        Self { input_tokens, output_tokens, cached_tokens: 0, total_tokens }
     }
 
     /// Create usage with cache information.
     pub fn with_cache(input_tokens: u64, output_tokens: u64, cached_tokens: u64) -> Self {
         let total_tokens = input_tokens + output_tokens;
-        Self {
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            total_tokens,
-        }
+        Self { input_tokens, output_tokens, cached_tokens, total_tokens }
     }
 
     /// Merge another usage into this one (accumulate).

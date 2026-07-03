@@ -21,7 +21,7 @@
 /// `TrustLevel::Permissive` + `ApprovalMode::Auto` is a forbidden combination
 /// (no safety layer at all). The approval layer must enforce this by
 /// downgrading `Auto` to `Always` when trust is `Permissive`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrustLevel {
     /// No restrictions (allows everything). Dangerous — should only be
     /// used for testing. When active, `ApprovalMode` must be `Always`.

@@ -124,31 +124,21 @@ impl ProviderInstanceConfig {
             return Ok(key.clone());
         }
         if let Some(env) = &self.api_key_env {
-            return std::env::var(env).map_err(|_| {
-                ProviderError::Auth(format!("environment variable {env} not set"))
-            });
+            return std::env::var(env)
+                .map_err(|_| ProviderError::Auth(format!("environment variable {env} not set")));
         }
-        Err(ProviderError::Auth(
-            "provider config must have api_key or api_key_env".to_string(),
-        ))
+        Err(ProviderError::Auth("provider config must have api_key or api_key_env".to_string()))
     }
 
     /// Resolve the base URL, falling back to the type's default.
     pub fn resolve_base_url(&self) -> &str {
-        self.base_url
-            .as_deref()
-            .or_else(|| self.r#type.default_base_url())
-            .unwrap_or("")
+        self.base_url.as_deref().or_else(|| self.r#type.default_base_url()).unwrap_or("")
     }
 
     /// Resolve a model name: if `name` is an alias, return the mapped model;
     /// otherwise return `name` as-is.
     pub fn resolve_model_name<'a>(&'a self, name: &'a str) -> &'a str {
-        if let Some(alias) = self.aliases.get(name) {
-            &alias.model
-        } else {
-            name
-        }
+        if let Some(alias) = self.aliases.get(name) { &alias.model } else { name }
     }
 }
 
@@ -182,12 +172,12 @@ impl LimConfig {
             Ok(content) => match toml::from_str(&content) {
                 Ok(config) => config,
                 Err(e) => {
-                    eprintln!("warning: failed to parse {}: {e}", path.display());
+                    tracing::warn!(path = %path.display(), error = %e, "failed to parse config, using defaults");
                     Self::default()
                 }
             },
             Err(e) => {
-                eprintln!("warning: failed to read {}: {e}", path.display());
+                tracing::warn!(path = %path.display(), error = %e, "failed to read config, using defaults");
                 Self::default()
             }
         }
@@ -207,13 +197,11 @@ impl LimConfig {
         if let Some(name) = cli_provider {
             return Ok(name);
         }
-        self.default_provider
-            .as_deref()
-            .ok_or_else(|| {
-                ProviderError::InvalidRequest(
-                    "no provider specified and no default_provider in config".to_string(),
-                )
-            })
+        self.default_provider.as_deref().ok_or_else(|| {
+            ProviderError::InvalidRequest(
+                "no provider specified and no default_provider in config".to_string(),
+            )
+        })
     }
 
     /// Resolve the effective model name: CLI model (with alias resolution) if
@@ -251,12 +239,10 @@ pub fn create_provider(
     // the endpoint suffix in all providers, so a base_url like
     // "https://api.openai.com/v1" would produce "/v1/v1/chat/completions".
     // full_url bypasses concatenation, so it's not checked.
-    if full_url.is_none()
-        && base_url.trim_end_matches('/').ends_with("/v1")
-    {
-        eprintln!(
-            "warning: base_url `{base_url}` ends with `/v1`; \
-             the version segment is now appended automatically — \
+    if full_url.is_none() && base_url.trim_end_matches('/').ends_with("/v1") {
+        tracing::warn!(
+            base_url = %base_url,
+            "base_url ends with `/v1`; the version segment is now appended automatically — \
              remove the trailing `/v1` to avoid `/v1/v1/...` in the endpoint"
         );
     }
@@ -300,7 +286,8 @@ pub fn create_provider(
             Ok(Arc::new(p))
         }
         ProviderType::Mock => Err(ProviderError::InvalidRequest(
-            "mock provider should not be configured in .lim/config.toml; use --provider mock".to_string(),
+            "mock provider should not be configured in .lim/config.toml; use --provider mock"
+                .to_string(),
         )),
     }
 }
@@ -360,10 +347,8 @@ model = "anthropic/claude-3.5-sonnet"
 
     #[test]
     fn resolve_provider_name_uses_cli_first() {
-        let config = LimConfig {
-            default_provider: Some("default".to_string()),
-            providers: HashMap::new(),
-        };
+        let config =
+            LimConfig { default_provider: Some("default".to_string()), providers: HashMap::new() };
         assert_eq!(config.resolve_provider_name(Some("explicit")).unwrap(), "explicit");
         assert_eq!(config.resolve_provider_name(None).unwrap(), "default");
     }
@@ -391,9 +376,15 @@ model = "anthropic/claude-3.5-sonnet"
             extra_headers: HashMap::new(),
         };
         // CLI model matches alias → resolves to alias target
-        assert_eq!(LimConfig::default().resolve_model(&instance, Some("alias")).unwrap(), "real/model");
+        assert_eq!(
+            LimConfig::default().resolve_model(&instance, Some("alias")).unwrap(),
+            "real/model"
+        );
         // CLI model is not an alias → passthrough
-        assert_eq!(LimConfig::default().resolve_model(&instance, Some("raw-model")).unwrap(), "raw-model");
+        assert_eq!(
+            LimConfig::default().resolve_model(&instance, Some("raw-model")).unwrap(),
+            "raw-model"
+        );
         // No CLI model → default_model
         assert_eq!(LimConfig::default().resolve_model(&instance, None).unwrap(), "default-model");
     }
@@ -440,14 +431,8 @@ model = "anthropic/claude-3.5-sonnet"
 
     #[test]
     fn provider_type_default_base_urls() {
-        assert_eq!(
-            ProviderType::OpenAIChat.default_base_url(),
-            Some("https://api.openai.com/v1")
-        );
-        assert_eq!(
-            ProviderType::Anthropic.default_base_url(),
-            Some("https://api.anthropic.com")
-        );
+        assert_eq!(ProviderType::OpenAIChat.default_base_url(), Some("https://api.openai.com/v1"));
+        assert_eq!(ProviderType::Anthropic.default_base_url(), Some("https://api.anthropic.com"));
         assert_eq!(ProviderType::Mock.default_base_url(), None);
     }
 
@@ -478,35 +463,25 @@ default_model = "deepseek-chat"
         let azure = config.provider("azure").unwrap();
         assert_eq!(
             azure.full_url.as_deref(),
-            Some("https://resource.openai.azure.com/openai/deployments/gpt4o/chat/completions?api-version=2024-08-01-preview")
+            Some(
+                "https://resource.openai.azure.com/openai/deployments/gpt4o/chat/completions?api-version=2024-08-01-preview"
+            )
         );
         // base_url not set for azure
         assert!(azure.base_url.is_none());
 
         let standard = config.provider("standard").unwrap();
         assert!(standard.full_url.is_none());
-        assert_eq!(
-            standard.base_url.as_deref(),
-            Some("https://api.deepseek.com/v1")
-        );
+        assert_eq!(standard.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
     }
 
     #[test]
     fn create_provider_with_full_url_succeeds() {
         // All three protocol types should accept full_url without error
         let cases = [
-            (
-                ProviderType::OpenAIChat,
-                "https://proxy.example.com/custom/chat",
-            ),
-            (
-                ProviderType::OpenAIResponses,
-                "https://proxy.example.com/custom/responses",
-            ),
-            (
-                ProviderType::Anthropic,
-                "https://proxy.example.com/custom/messages",
-            ),
+            (ProviderType::OpenAIChat, "https://proxy.example.com/custom/chat"),
+            (ProviderType::OpenAIResponses, "https://proxy.example.com/custom/responses"),
+            (ProviderType::Anthropic, "https://proxy.example.com/custom/messages"),
         ];
 
         for (ptype, url) in cases {

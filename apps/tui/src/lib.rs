@@ -35,14 +35,15 @@ mod ui;
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use lim_core::error::Result;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use lim_agent::agent_loop::{AgentConfig, AgentLoop};
+use lim_agent::context_window::{ContextConfig, ContextWindowManager};
 use lim_agent::registry::ToolRegistry;
-use lim_llm::providers::config::LimConfig;
 use lim_llm::Provider;
+use lim_llm::providers::config::LimConfig;
 
 pub use app::App;
 pub use approval::{
@@ -81,9 +82,17 @@ pub async fn run(config: TuiConfig) -> Result<()> {
         trust_level,
     } = config;
 
-    let agent_config = AgentConfig {
-        model: model.clone(),
-        ..AgentConfig::default()
+    let agent_config = {
+        // Detect platform and inject into system prompt so the LLM knows which
+        // shell syntax to use (POSIX vs PowerShell, etc.). Done here so the
+        // TUI is self-contained — apps/cli doesn't need to pass it in.
+        let platform = lim_core::PlatformInfo::detect();
+        let inject = lim_core::InjectInfo::new(platform);
+        AgentConfig {
+            model: model.clone(),
+            system_prompt: Some(inject.system_prompt_fragment()),
+            ..AgentConfig::default()
+        }
     };
 
     // Set up approval channel: ApprovalHooks sends ApprovalRequest to the TUI,
@@ -109,7 +118,13 @@ pub async fn run(config: TuiConfig) -> Result<()> {
 
     let agent = AgentLoop::new(provider, registry, event_tx.clone(), cancel.clone())
         .with_config(agent_config)
-        .with_hooks(hooks.clone());
+        .with_hooks(hooks.clone())
+        // Wire up the ContextWindowManager so auto-compact triggers when
+        // the conversation exceeds the model's context budget. The default
+        // config (128K window, 8K output, 0.8 trigger ratio, keep 4 recent
+        // pairs) is a reasonable starting point; per-model overrides can be
+        // added when lim ships a real config system.
+        .with_context_window(ContextWindowManager::new(ContextConfig::default()));
 
     let mut app = App::new(
         agent,

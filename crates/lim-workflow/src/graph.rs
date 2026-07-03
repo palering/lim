@@ -12,11 +12,9 @@ pub struct WorkflowGraph {
 }
 
 impl WorkflowGraph {
+    /// Create a new empty [`WorkflowGraph`].
     pub fn new() -> Self {
-        Self {
-            nodes: HashMap::new(),
-            edges: Vec::new(),
-        }
+        Self { nodes: HashMap::new(), edges: Vec::new() }
     }
 
     /// Add a node to the graph.
@@ -30,26 +28,18 @@ impl WorkflowGraph {
     }
 
     /// Get a node by ID.
-    pub fn get_node(&self, id: &str) -> Option<&Node> {
+    pub fn node(&self, id: &str) -> Option<&Node> {
         self.nodes.get(id)
     }
 
     /// Get all predecessors of a node.
     pub fn predecessors(&self, node_id: &str) -> Vec<NodeId> {
-        self.edges
-            .iter()
-            .filter(|(_, to)| to == node_id)
-            .map(|(from, _)| from.clone())
-            .collect()
+        self.edges.iter().filter(|(_, to)| to == node_id).map(|(from, _)| from.clone()).collect()
     }
 
     /// Get all successors of a node.
     pub fn successors(&self, node_id: &str) -> Vec<NodeId> {
-        self.edges
-            .iter()
-            .filter(|(from, _)| from == node_id)
-            .map(|(_, to)| to.clone())
-            .collect()
+        self.edges.iter().filter(|(from, _)| from == node_id).map(|(_, to)| to.clone()).collect()
     }
 
     /// Return all node IDs.
@@ -97,7 +87,9 @@ impl WorkflowGraph {
                     if visited.contains(&succ) {
                         continue;
                     }
-                    let deg = in_degree.get_mut(succ.as_str()).unwrap();
+                    let deg = in_degree
+                        .get_mut(succ.as_str())
+                        .expect("successor must be in in_degree map");
                     *deg -= 1;
                     if *deg == 0 {
                         next_queue.push(succ);
@@ -117,9 +109,7 @@ impl WorkflowGraph {
 
         // Check for cycles
         if visited.len() != self.nodes.len() {
-            return Err(LimError::Config(
-                "workflow graph contains a cycle".to_string(),
-            ));
+            return Err(LimError::Config("workflow graph contains a cycle".to_string()));
         }
 
         Ok(levels)
@@ -139,12 +129,7 @@ mod tests {
     use std::sync::Arc;
 
     fn transform_node(id: &str) -> Node {
-        Node::new(
-            id,
-            NodeKind::Transform {
-                transform: Arc::new(|_ctx, input| input.clone()),
-            },
-        )
+        Node::new(id, NodeKind::Transform { transform: Arc::new(|_ctx, input| input.clone()) })
     }
 
     #[test]

@@ -17,11 +17,9 @@ pub struct Node {
 }
 
 impl Node {
+    /// Create a new workflow [`Node`] with the given ID and kind.
     pub fn new(id: impl Into<NodeId>, kind: NodeKind) -> Self {
-        Self {
-            id: id.into(),
-            kind,
-        }
+        Self { id: id.into(), kind }
     }
 }
 
@@ -40,13 +38,13 @@ pub enum NodeKind {
     /// a list of (branch_label, data) pairs. Each branch will be available
     /// as a separate entry in the context.
     ParallelFanOut {
-        splitter: Arc<dyn Fn(&WorkflowContext, &NodeOutput) -> Vec<(String, serde_json::Value)> + Send + Sync>,
+        splitter: Arc<
+            dyn Fn(&WorkflowContext, &NodeOutput) -> Vec<(String, serde_json::Value)> + Send + Sync,
+        >,
     },
 
     /// Collect all predecessor outputs and combine them.
-    FanIn {
-        combiner: Arc<dyn Fn(&WorkflowContext, &[NodeOutput]) -> NodeOutput + Send + Sync>,
-    },
+    FanIn { combiner: Arc<dyn Fn(&WorkflowContext, &[NodeOutput]) -> NodeOutput + Send + Sync> },
 
     /// A review loop: writer → reviewer → pass/fail → rewrite, up to max_retries.
     ///
@@ -63,9 +61,7 @@ pub enum NodeKind {
     },
 
     /// A pure data transformation node (no agent involved).
-    Transform {
-        transform: Arc<dyn Fn(&WorkflowContext, &NodeOutput) -> NodeOutput + Send + Sync>,
-    },
+    Transform { transform: Arc<dyn Fn(&WorkflowContext, &NodeOutput) -> NodeOutput + Send + Sync> },
 }
 
 /// Output produced by a workflow node.
@@ -99,11 +95,7 @@ impl NodeOutput {
                         })
                     })
                     .collect();
-                if texts.is_empty() {
-                    None
-                } else {
-                    Some(texts.join("\n\n"))
-                }
+                if texts.is_empty() { None } else { Some(texts.join("\n\n")) }
             }
             NodeOutput::Data(value) => value.as_str().map(|s| s.to_string()),
             _ => None,

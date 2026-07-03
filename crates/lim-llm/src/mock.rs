@@ -12,7 +12,12 @@ use crate::stream::StreamEvent;
 /// A scripted response that the [`MockProvider`] can return.
 ///
 /// Used for deterministic testing of the agent loop without a real LLM.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone` because `MockResponse::Error(ProviderError)` wraps a
+/// `ProviderError` whose `Transport` variant holds a non-`Clone`
+/// `reqwest::Error`. Mock responses are consumed once by `MockProvider`,
+/// so `Clone` is not needed.
+#[derive(Debug)]
 pub enum MockResponse {
     /// Simple text response (no tool calls).
     Text(String),
@@ -38,11 +43,9 @@ pub struct MockToolCall {
 }
 
 impl MockToolCall {
+    /// Create a new mock tool call with the given name and arguments.
     pub fn new(name: impl Into<String>, arguments: serde_json::Value) -> Self {
-        Self {
-            name: name.into(),
-            arguments,
-        }
+        Self { name: name.into(), arguments }
     }
 }
 
@@ -57,9 +60,7 @@ pub struct MockProvider {
 impl MockProvider {
     /// Create a mock provider with a sequence of scripted responses.
     pub fn new(responses: Vec<MockResponse>) -> Self {
-        Self {
-            responses: std::sync::Mutex::new(responses),
-        }
+        Self { responses: std::sync::Mutex::new(responses) }
     }
 
     /// Create an empty mock provider (useful for manual test setup).
@@ -74,28 +75,22 @@ impl Provider for MockProvider {
         _request: LlmRequest,
     ) -> BoxStream<'a, Result<StreamEvent, ProviderError>> {
         let response = {
-            let mut queue = self.responses.lock().unwrap();
-            if queue.is_empty() {
-                None
-            } else {
-                Some(queue.remove(0))
-            }
+            let mut queue =
+                self.responses.lock().expect("MockProvider mutex cannot poison (no panic path)");
+            if queue.is_empty() { None } else { Some(queue.remove(0)) }
         };
 
         match response {
             None => {
-                let err = ProviderError::Stream(
-                    "MockProvider: no more scripted responses".to_string(),
-                );
+                let err =
+                    ProviderError::Stream("MockProvider: no more scripted responses".to_string());
                 stream::once(async move { Err(err) }).boxed()
             }
             Some(MockResponse::Text(text)) => {
                 let events = vec![
                     Ok(StreamEvent::TextDelta { text }),
                     Ok(StreamEvent::Usage(Usage::new(10, 20))),
-                    Ok(StreamEvent::Done {
-                        stop_reason: StopReason::EndTurn,
-                    }),
+                    Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn }),
                 ];
                 stream::iter(events).boxed()
             }
@@ -119,15 +114,11 @@ impl Provider for MockProvider {
                 }
 
                 events.push(Ok(StreamEvent::Usage(Usage::new(15, 25))));
-                events.push(Ok(StreamEvent::Done {
-                    stop_reason: StopReason::ToolCall,
-                }));
+                events.push(Ok(StreamEvent::Done { stop_reason: StopReason::ToolCall }));
 
                 stream::iter(events).boxed()
             }
-            Some(MockResponse::Error(err)) => {
-                stream::once(async move { Err(err) }).boxed()
-            }
+            Some(MockResponse::Error(err)) => stream::once(async move { Err(err) }).boxed(),
         }
     }
 

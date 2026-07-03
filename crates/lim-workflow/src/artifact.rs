@@ -31,6 +31,7 @@ pub struct ArtifactStore {
 }
 
 impl ArtifactStore {
+    /// Create a new [`ArtifactStore`] rooted at `base_dir`.
     pub fn new(base_dir: Utf8PathBuf) -> Self {
         Self { base_dir }
     }
@@ -38,27 +39,26 @@ impl ArtifactStore {
     /// Store an artifact to disk.
     pub async fn store(&self, artifact: &Artifact) -> Result<()> {
         // Ensure base directory exists
-        tokio::fs::create_dir_all(self.base_dir.as_std_path())
-            .await
-            .map_err(|e| LimError::ToolExecution {
-                name: "artifact_store".to_string(),
-                message: format!("failed to create artifact directory: {e}"),
-            })?;
+        tokio::fs::create_dir_all(self.base_dir.as_std_path()).await.map_err(|e| {
+            LimError::tool_execution(
+                "artifact_store",
+                format!("failed to create artifact directory: {e}"),
+                e,
+            )
+        })?;
 
         let path = self.base_dir.join(format!("{}.json", artifact.id));
         let json = serde_json::to_string_pretty(artifact).map_err(|e| {
-            LimError::ToolExecution {
-                name: "artifact_store".to_string(),
-                message: format!("failed to serialize artifact: {e}"),
-            }
+            LimError::tool_execution(
+                "artifact_store",
+                format!("failed to serialize artifact: {e}"),
+                e,
+            )
         })?;
 
-        tokio::fs::write(path.as_std_path(), json.as_bytes())
-            .await
-            .map_err(|e| LimError::ToolExecution {
-                name: "artifact_store".to_string(),
-                message: format!("failed to write artifact: {e}"),
-            })?;
+        tokio::fs::write(path.as_std_path(), json.as_bytes()).await.map_err(|e| {
+            LimError::tool_execution("artifact_store", format!("failed to write artifact: {e}"), e)
+        })?;
 
         Ok(())
     }
@@ -66,16 +66,20 @@ impl ArtifactStore {
     /// Load an artifact from disk.
     pub async fn load(&self, id: ArtifactId) -> Result<Artifact> {
         let path = self.base_dir.join(format!("{id}.json"));
-        let content = tokio::fs::read_to_string(path.as_std_path())
-            .await
-            .map_err(|e| LimError::ToolExecution {
-                name: "artifact_store".to_string(),
-                message: format!("failed to read artifact `{id}`: {e}"),
-            })?;
+        let content = tokio::fs::read_to_string(path.as_std_path()).await.map_err(|e| {
+            LimError::tool_execution(
+                "artifact_store",
+                format!("failed to read artifact `{id}`: {e}"),
+                e,
+            )
+        })?;
 
-        serde_json::from_str(&content).map_err(|e| LimError::ToolExecution {
-            name: "artifact_store".to_string(),
-            message: format!("failed to parse artifact `{id}`: {e}"),
+        serde_json::from_str(&content).map_err(|e| {
+            LimError::tool_execution(
+                "artifact_store",
+                format!("failed to parse artifact `{id}`: {e}"),
+                e,
+            )
         })
     }
 
@@ -83,27 +87,26 @@ impl ArtifactStore {
     pub async fn list(&self) -> Result<Vec<Artifact>> {
         let mut artifacts = Vec::new();
 
-        let mut entries = tokio::fs::read_dir(self.base_dir.as_std_path())
-            .await
-            .map_err(|e| LimError::ToolExecution {
-                name: "artifact_store".to_string(),
-                message: format!("failed to read artifact directory: {e}"),
-            })?;
+        let mut entries = tokio::fs::read_dir(self.base_dir.as_std_path()).await.map_err(|e| {
+            LimError::tool_execution(
+                "artifact_store",
+                format!("failed to read artifact directory: {e}"),
+                e,
+            )
+        })?;
 
         while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            LimError::ToolExecution {
-                name: "artifact_store".to_string(),
-                message: format!("failed to list artifacts: {e}"),
-            }
+            LimError::tool_execution("artifact_store", format!("failed to list artifacts: {e}"), e)
         })? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                let content = tokio::fs::read_to_string(&path)
-                    .await
-                    .map_err(|e| LimError::ToolExecution {
-                        name: "artifact_store".to_string(),
-                        message: format!("failed to read artifact file: {e}"),
-                    })?;
+                let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+                    LimError::tool_execution(
+                        "artifact_store",
+                        format!("failed to read artifact file: {e}"),
+                        e,
+                    )
+                })?;
                 if let Ok(artifact) = serde_json::from_str::<Artifact>(&content) {
                     artifacts.push(artifact);
                 }

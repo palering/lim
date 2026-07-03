@@ -14,7 +14,7 @@ pub type ToolFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Each tool has a name (unique within a registry), a JSON Schema describing
 /// its input parameters, and an async execute method.
 pub trait Tool: Send + Sync {
-    /// Unique name for this tool (e.g., "read", "write", "bash").
+    /// Unique name for this tool (e.g., "read", "write", "shell").
     fn name(&self) -> &str;
 
     /// Schema sent to the LLM so it can generate valid tool calls.

@@ -1,6 +1,6 @@
 use camino::Utf8Path;
-use lim_core::event::EventEnvelope;
 use lim_core::error::Result;
+use lim_core::event::EventEnvelope;
 use tokio::io::AsyncWriteExt;
 
 /// Writes event envelopes to a JSONL file (one JSON object per line).
@@ -32,9 +32,12 @@ impl SessionWriter {
             .truncate(true)
             .open(path.as_std_path())
             .await
-            .map_err(|e| lim_core::error::LimError::ToolExecution {
-                name: "session_writer".to_string(),
-                message: format!("failed to open session file `{path}`: {e}"),
+            .map_err(|e| {
+                lim_core::error::LimError::tool_execution(
+                    "session_writer",
+                    format!("failed to open session file `{path}`: {e}"),
+                    e,
+                )
             })?;
         Ok(Self { file })
     }
@@ -42,23 +45,26 @@ impl SessionWriter {
     /// Write a single event envelope as a JSON line.
     pub async fn write_event(&mut self, envelope: &EventEnvelope) -> Result<()> {
         let mut line = serde_json::to_string(envelope).map_err(|e| {
-            lim_core::error::LimError::ToolExecution {
-                name: "session_writer".to_string(),
-                message: format!("failed to serialize event: {e}"),
-            }
+            lim_core::error::LimError::tool_execution(
+                "session_writer",
+                format!("failed to serialize event: {e}"),
+                e,
+            )
         })?;
         line.push('\n');
         self.file.write_all(line.as_bytes()).await.map_err(|e| {
-            lim_core::error::LimError::ToolExecution {
-                name: "session_writer".to_string(),
-                message: format!("failed to write event: {e}"),
-            }
+            lim_core::error::LimError::tool_execution(
+                "session_writer",
+                format!("failed to write event: {e}"),
+                e,
+            )
         })?;
         self.file.flush().await.map_err(|e| {
-            lim_core::error::LimError::ToolExecution {
-                name: "session_writer".to_string(),
-                message: format!("failed to flush event: {e}"),
-            }
+            lim_core::error::LimError::tool_execution(
+                "session_writer",
+                format!("failed to flush event: {e}"),
+                e,
+            )
         })?;
         Ok(())
     }
@@ -193,10 +199,7 @@ mod tests {
             !content_b.contains(&session_a_str),
             "run A's session id must not leak into run B's file"
         );
-        assert!(
-            content_b.contains(&session_b_str),
-            "run B's session id must be present"
-        );
+        assert!(content_b.contains(&session_b_str), "run B's session id must be present");
 
         // Cleanup
         let _ = std::fs::remove_dir_all(dir);

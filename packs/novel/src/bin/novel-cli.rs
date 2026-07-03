@@ -52,10 +52,7 @@ enum FixtureEntry {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_calls")]
-    ToolCalls {
-        text: Option<String>,
-        calls: Vec<FixtureToolCall>,
-    },
+    ToolCalls { text: Option<String>, calls: Vec<FixtureToolCall> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,17 +63,19 @@ struct FixtureToolCall {
 
 fn load_fixture(path: &Utf8PathBuf) -> Result<Vec<MockResponse>> {
     let content = std::fs::read_to_string(path.as_std_path()).map_err(|e| {
-        LimError::ToolExecution {
-            name: "fixture_loader".to_string(),
-            message: format!("failed to read fixture `{path}`: {e}"),
-        }
+        LimError::tool_execution(
+            "fixture_loader",
+            format!("failed to read fixture `{path}`: {e}"),
+            e,
+        )
     })?;
 
     let entries: Vec<FixtureEntry> = serde_json::from_str(&content).map_err(|e| {
-        LimError::ToolExecution {
-            name: "fixture_loader".to_string(),
-            message: format!("failed to parse fixture `{path}`: {e}"),
-        }
+        LimError::tool_execution(
+            "fixture_loader",
+            format!("failed to parse fixture `{path}`: {e}"),
+            e,
+        )
     })?;
 
     let responses: Vec<MockResponse> = entries
@@ -87,9 +86,7 @@ fn load_fixture(path: &Utf8PathBuf) -> Result<Vec<MockResponse>> {
                 text,
                 calls: calls
                     .into_iter()
-                    .map(|c| {
-                        lim_llm::mock::MockToolCall::new(c.name, c.arguments)
-                    })
+                    .map(|c| lim_llm::mock::MockToolCall::new(c.name, c.arguments))
                     .collect(),
             },
         })
@@ -100,16 +97,10 @@ fn load_fixture(path: &Utf8PathBuf) -> Result<Vec<MockResponse>> {
 
 fn load_json<T: serde::de::DeserializeOwned>(path: &Utf8PathBuf) -> Result<T> {
     let content = std::fs::read_to_string(path.as_std_path()).map_err(|e| {
-        LimError::ToolExecution {
-            name: "file_loader".to_string(),
-            message: format!("failed to read `{path}`: {e}"),
-        }
+        LimError::tool_execution("file_loader", format!("failed to read `{path}`: {e}"), e)
     })?;
     serde_json::from_str(&content).map_err(|e| {
-        LimError::ToolExecution {
-            name: "json_parser".to_string(),
-            message: format!("failed to parse `{path}`: {e}"),
-        }
+        LimError::tool_execution("json_parser", format!("failed to parse `{path}`: {e}"), e)
     })
 }
 
@@ -125,12 +116,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Chapter {
-            bible,
-            outline,
-            responses,
-            output,
-        } => {
+        Commands::Chapter { bible, outline, responses, output } => {
             run_chapter(bible, outline, responses, output).await?;
         }
     }
@@ -159,11 +145,7 @@ async fn run_chapter(
 
     let graph = build_chapter_workflow(&bible, &outline);
     let levels = graph.topological_order()?;
-    println!(
-        "Workflow: {} nodes in {} levels",
-        graph.node_ids().len(),
-        levels.len()
-    );
+    println!("Workflow: {} nodes in {} levels", graph.node_ids().len(), levels.len());
 
     let provider = Arc::new(MockProvider::new(responses));
     let registry = Arc::new(ToolRegistry::new());
@@ -175,13 +157,8 @@ async fn run_chapter(
     let (wf_event_tx, _wf_event_rx) = broadcast::channel(100);
     let cancel = CancellationToken::new();
 
-    let executor = WorkflowExecutor::new(
-        provider,
-        registry,
-        artifact_store.clone(),
-        cancel,
-        wf_event_tx,
-    );
+    let executor =
+        WorkflowExecutor::new(provider, registry, artifact_store.clone(), cancel, wf_event_tx);
 
     let context = WorkflowContext::new();
 
@@ -192,7 +169,7 @@ async fn run_chapter(
 
     for scene in &outline.scenes {
         let node_id = format!("scene_{}_loop", scene.scene_number);
-        if let Some(output) = final_context.get_output(&node_id) {
+        if let Some(output) = final_context.output(&node_id) {
             println!("\nScene {} ({}):", scene.scene_number, scene.setting);
             if let NodeOutput::Data(v) = &output
                 && let Some(draft) = v.get("draft").and_then(|d| d.as_str())
@@ -207,7 +184,7 @@ async fn run_chapter(
         }
     }
 
-    if let Some(chapter_output) = final_context.get_output("chapter") {
+    if let Some(chapter_output) = final_context.output("chapter") {
         println!("\n--- Final Chapter ---");
         if let NodeOutput::Data(v) = &chapter_output
             && let Some(text) = v.get("text").and_then(|t| t.as_str())

@@ -11,25 +11,13 @@ pub enum WorkflowEvent {
     NodeStart { node_id: NodeId },
 
     /// A workflow node finished executing.
-    NodeEnd {
-        node_id: NodeId,
-        output_summary: String,
-    },
+    NodeEnd { node_id: NodeId, output_summary: String },
 
     /// An artifact was created during workflow execution.
-    ArtifactCreated {
-        artifact_id: ArtifactId,
-        kind: String,
-        node_id: NodeId,
-    },
+    ArtifactCreated { artifact_id: ArtifactId, kind: String, node_id: NodeId },
 
     /// A review loop iteration completed.
-    ReviewResult {
-        node_id: NodeId,
-        passed: bool,
-        score: f64,
-        attempt: usize,
-    },
+    ReviewResult { node_id: NodeId, passed: bool, score: f64, attempt: usize },
 
     /// The entire workflow started.
     WorkflowStart,

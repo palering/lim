@@ -56,6 +56,10 @@ define_id!(TurnId, "Unique identifier for a single turn in the agent loop.");
 define_id!(MessageId, "Unique identifier for a message.");
 define_id!(ArtifactId, "Unique identifier for an artifact.");
 define_id!(TraceId, "Trace identifier for correlating events across a run.");
+define_id!(
+    GoalId,
+    "Unique identifier for a Loop Engineering goal (cross-session long-running task)."
+);
 
 /// Unique identifier for a tool call.
 ///

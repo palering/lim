@@ -41,6 +41,10 @@ lim/
 - [architecture.md](architecture.md) — Confirmed architectural decisions: frontend/library boundary, directory structure, library exportability.
 - [packaging-plan.md](packaging-plan.md) — Cross-platform packaging & distribution plan (Phase A baseline binaries → Phase B package managers → Phase C self-update).
 
+### architecture/
+
+- [architecture/behavior-trace.md](architecture/behavior-trace.md) — 行为链路与可观测性文档：6 条设计原则、Agent Loop / Tool / Provider / Session 链路梳理、已知黑盒点、PR review 与迭代检查清单。**Code review 的关键参考**。
+
 ### archive/
 
 - [completed-phases.md](archive/completed-phases.md) — Technical details for each completed phase: key patterns, Rust pitfalls, acceptance criteria. Referenced from PROGRESS.md.

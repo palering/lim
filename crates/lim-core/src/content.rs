@@ -32,10 +32,7 @@ pub enum ContentBlock {
     },
 
     /// Reference to an artifact produced during the session.
-    ArtifactRef {
-        artifact_id: ArtifactId,
-        label: Option<String>,
-    },
+    ArtifactRef { artifact_id: ArtifactId, label: Option<String> },
 }
 
 impl ContentBlock {
@@ -50,12 +47,12 @@ impl ContentBlock {
     }
 
     /// Create a tool call content block.
-    pub fn tool_call(id: ToolCallId, name: impl Into<String>, arguments: serde_json::Value) -> Self {
-        Self::ToolCall {
-            id,
-            name: name.into(),
-            arguments,
-        }
+    pub fn tool_call(
+        id: ToolCallId,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Self::ToolCall { id, name: name.into(), arguments }
     }
 
     /// Returns `true` if this block is a tool call.
@@ -66,11 +63,7 @@ impl ContentBlock {
     /// If this is a tool call, return its ID and name.
     pub fn as_tool_call(&self) -> Option<(&ToolCallId, &str, &serde_json::Value)> {
         match self {
-            Self::ToolCall {
-                id,
-                name,
-                arguments,
-            } => Some((id, name.as_str(), arguments)),
+            Self::ToolCall { id, name, arguments } => Some((id, name.as_str(), arguments)),
             _ => None,
         }
     }
@@ -78,14 +71,22 @@ impl ContentBlock {
 
 /// Base64 encoding/decoding for byte vectors in serde.
 mod base64_bytes {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
 
+    /// Serialize bytes as a base64 string.
+    ///
+    /// # Errors
+    /// Returns an error if the serializer fails to write the string.
     pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         let encoded = STANDARD.encode(data);
         serializer.serialize_str(&encoded)
     }
 
+    /// Deserialize a base64 string into bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the input is not a valid base64 string.
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(deserializer)?;
         STANDARD.decode(&s).map_err(serde::de::Error::custom)
@@ -129,10 +130,8 @@ mod tests {
     #[test]
     fn image_block_base64_roundtrip() {
         let pixels = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]; // fake JPEG header
-        let block = ContentBlock::Image {
-            data: pixels.clone(),
-            mime_type: "image/jpeg".to_string(),
-        };
+        let block =
+            ContentBlock::Image { data: pixels.clone(), mime_type: "image/jpeg".to_string() };
         let json = serde_json::to_string(&block).unwrap();
         // Verify it's a base64 string, not a byte array
         assert!(json.contains("\"data\":\"/9j/4AAQ\""), "expected base64 string in JSON: {json}");

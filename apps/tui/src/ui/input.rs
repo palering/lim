@@ -2,18 +2,18 @@
 //!
 //! Enter sends, Shift+Enter inserts newline. Shows a prompt "›".
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use crate::app::App;
 
+/// Render the multi-line input box with prompt and cursor.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block =
+        Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray));
 
     let input = app.input();
     let cursor = app.input_cursor();
@@ -42,10 +42,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     for (i, line) in lines.iter().enumerate() {
         if i == 0 {
-            text_lines.push(Line::from(vec![
-                prompt.clone(),
-                Span::raw(*line),
-            ]));
+            text_lines.push(Line::from(vec![prompt.clone(), Span::raw(*line)]));
         } else {
             text_lines.push(Line::from(format!("  {line}")));
         }

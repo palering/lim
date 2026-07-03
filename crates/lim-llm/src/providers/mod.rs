@@ -10,8 +10,6 @@ pub mod openai_responses;
 
 // Re-export provider structs and config types.
 pub use anthropic::AnthropicProvider;
-pub use config::{
-    create_provider, LimConfig, ModelAlias, ProviderInstanceConfig, ProviderType,
-};
+pub use config::{LimConfig, ModelAlias, ProviderInstanceConfig, ProviderType, create_provider};
 pub use openai_chat::OpenAiChatProvider;
 pub use openai_responses::OpenAiResponsesProvider;

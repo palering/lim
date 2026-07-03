@@ -42,26 +42,17 @@ pub fn replay_edits(events: &[EventEnvelope]) -> Vec<ContextEdit> {
 
 /// Extract only assistant messages from a transcript.
 pub fn assistant_messages(transcript: &[AgentMessage]) -> Vec<&AgentMessage> {
-    transcript
-        .iter()
-        .filter(|m| m.role == lim_core::message::Role::Assistant)
-        .collect()
+    transcript.iter().filter(|m| m.role == lim_core::message::Role::Assistant).collect()
 }
 
 /// Extract only user messages from a transcript.
 pub fn user_messages(transcript: &[AgentMessage]) -> Vec<&AgentMessage> {
-    transcript
-        .iter()
-        .filter(|m| m.role == lim_core::message::Role::User)
-        .collect()
+    transcript.iter().filter(|m| m.role == lim_core::message::Role::User).collect()
 }
 
 /// Count the number of tool calls across all messages in a transcript.
 pub fn count_tool_calls(transcript: &[AgentMessage]) -> usize {
-    transcript
-        .iter()
-        .map(|m| m.tool_calls().len())
-        .sum()
+    transcript.iter().map(|m| m.tool_calls().len()).sum()
 }
 
 #[cfg(test)]
@@ -79,10 +70,7 @@ mod tests {
             SessionId::new(),
             BranchId::new(),
             TraceId::new(),
-            AgentEvent::MessageEnd {
-                message_id: mid,
-                message: msg,
-            },
+            AgentEvent::MessageEnd { message_id: mid, message: msg },
         )
     }
 
@@ -132,10 +120,8 @@ mod tests {
             "read",
             serde_json::json!({"path": "test.txt"}),
         )]);
-        let tool_msg =
-            AgentMessage::tool_result(tc_id, "file contents here", false);
-        let final_msg =
-            AgentMessage::assistant(vec![ContentBlock::text("The file says...")]);
+        let tool_msg = AgentMessage::tool_result(tc_id, "file contents here", false);
+        let final_msg = AgentMessage::assistant(vec![ContentBlock::text("The file says...")]);
 
         let events = vec![
             make_message_end(user_msg),
@@ -169,6 +155,11 @@ mod tests {
                 TraceId::new(),
                 AgentEvent::TurnStart {
                     turn_id: lim_core::id::TurnId::new(),
+                    model: "test-model".to_string(),
+                    message_count: 0,
+                    tool_count: 0,
+                    tool_names: vec![],
+                    system_prompt_len: None,
                 },
             ),
             EventEnvelope::new(
@@ -189,14 +180,8 @@ mod tests {
         use lim_core::context_edit::ContextEdit;
         use std::collections::HashSet;
 
-        let edit1 = ContextEdit {
-            exclude: HashSet::from([0, 1]),
-            ..Default::default()
-        };
-        let edit2 = ContextEdit {
-            exclude: HashSet::from([5]),
-            ..Default::default()
-        };
+        let edit1 = ContextEdit { exclude: HashSet::from([0, 1]), ..Default::default() };
+        let edit2 = ContextEdit { exclude: HashSet::from([5]), ..Default::default() };
 
         let events = vec![
             EventEnvelope::new(

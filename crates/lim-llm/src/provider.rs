@@ -29,13 +29,7 @@ pub struct LlmRequest {
 impl LlmRequest {
     /// Create a minimal request with just model and messages.
     pub fn new(model: impl Into<String>, messages: Vec<LlmMessage>) -> Self {
-        Self {
-            model: model.into(),
-            messages,
-            tools: Vec::new(),
-            system: None,
-            max_tokens: None,
-        }
+        Self { model: model.into(), messages, tools: Vec::new(), system: None, max_tokens: None }
     }
 
     /// Add tool definitions to the request.

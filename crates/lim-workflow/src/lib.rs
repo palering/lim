@@ -1,3 +1,11 @@
+//! lim-workflow: DAG-based workflow orchestration.
+//!
+//! Builds a directed acyclic graph of [`Node`]s, computes layered
+//! topological order via Kahn's algorithm, and executes each layer
+//! concurrently using [`WorkflowExecutor`]. [`WorkflowContext`] carries
+//! outputs and arbitrary data between nodes; [`ArtifactStore`] persists
+//! workflow artifacts.
+
 pub mod artifact;
 pub mod context;
 pub mod events;

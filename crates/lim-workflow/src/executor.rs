@@ -34,6 +34,7 @@ pub struct WorkflowExecutor {
 }
 
 impl WorkflowExecutor {
+    /// Create a new [`WorkflowExecutor`] with the given dependencies.
     pub fn new(
         provider: Arc<dyn Provider>,
         registry: Arc<ToolRegistry>,
@@ -41,13 +42,7 @@ impl WorkflowExecutor {
         cancel: CancellationToken,
         event_tx: broadcast::Sender<WorkflowEvent>,
     ) -> Self {
-        Self {
-            provider,
-            registry,
-            artifact_store,
-            cancel,
-            event_tx,
-        }
+        Self { provider, registry, artifact_store, cancel, event_tx }
     }
 
     /// Execute a workflow graph and return the final context.
@@ -74,12 +69,12 @@ impl WorkflowExecutor {
             let futures: Vec<_> = level
                 .iter()
                 .map(|node_id| {
-                    let node = graph.get_node(node_id).expect("node must exist");
+                    let node = graph.node(node_id).expect("node must exist");
                     let nid = node_id.clone();
                     let kind = node.kind.clone();
                     let ctx = context.clone();
                     let predecessors = graph.predecessors(node_id);
-                    let pred_outputs = ctx.get_outputs(&predecessors);
+                    let pred_outputs = ctx.outputs(&predecessors);
                     let provider = Arc::clone(&self.provider);
                     let registry = Arc::clone(&self.registry);
                     let cancel = self.cancel.clone();
@@ -138,15 +133,10 @@ impl WorkflowExecutor {
         cancel: CancellationToken,
         event_tx: broadcast::Sender<WorkflowEvent>,
     ) -> Result<NodeOutput> {
-        let _ = event_tx.send(WorkflowEvent::NodeStart {
-            node_id: node_id.clone(),
-        });
+        let _ = event_tx.send(WorkflowEvent::NodeStart { node_id: node_id.clone() });
 
         let output = match kind {
-            NodeKind::AgentRun {
-                system_prompt,
-                initial_message_fn,
-            } => {
+            NodeKind::AgentRun { system_prompt, initial_message_fn } => {
                 Self::run_agent_node(
                     node_id,
                     &system_prompt,
@@ -168,9 +158,7 @@ impl WorkflowExecutor {
                 NodeOutput::Empty
             }
 
-            NodeKind::FanIn { combiner } => {
-                combiner(ctx, pred_outputs)
-            }
+            NodeKind::FanIn { combiner } => combiner(ctx, pred_outputs),
 
             NodeKind::ReviewLoop {
                 writer_prompt_fn,
@@ -202,15 +190,9 @@ impl WorkflowExecutor {
         };
 
         let summary = format!("{output:?}");
-        let summary = if summary.len() > 100 {
-            format!("{}...", &summary[..100])
-        } else {
-            summary
-        };
-        let _ = event_tx.send(WorkflowEvent::NodeEnd {
-            node_id: node_id.clone(),
-            output_summary: summary,
-        });
+        let summary = if summary.len() > 100 { format!("{}...", &summary[..100]) } else { summary };
+        let _ = event_tx
+            .send(WorkflowEvent::NodeEnd { node_id: node_id.clone(), output_summary: summary });
 
         Ok(output)
     }
@@ -235,8 +217,7 @@ impl WorkflowExecutor {
             model: String::new(),
         };
 
-        let mut agent = AgentLoop::new(provider, registry, event_tx, cancel)
-            .with_config(config);
+        let mut agent = AgentLoop::new(provider, registry, event_tx, cancel).with_config(config);
 
         let initial_message = initial_message_fn(ctx);
         let messages = agent.run(initial_message).await?;
@@ -289,9 +270,8 @@ impl WorkflowExecutor {
             )
             .await?;
 
-            current_draft = writer_output
-                .extract_text()
-                .unwrap_or_else(|| "[empty draft]".to_string());
+            current_draft =
+                writer_output.extract_text().unwrap_or_else(|| "[empty draft]".to_string());
 
             // 2. Reviewer: evaluate draft
             let draft_value = serde_json::json!({
@@ -310,9 +290,7 @@ impl WorkflowExecutor {
             .await?;
 
             // 3. Parse review
-            let review_text = reviewer_output
-                .extract_text()
-                .unwrap_or_default();
+            let review_text = reviewer_output.extract_text().unwrap_or_default();
 
             let review = parse_review_response(&review_text);
 
@@ -323,13 +301,7 @@ impl WorkflowExecutor {
                 attempt,
             });
 
-            info!(
-                node_id,
-                attempt,
-                score = review.score,
-                passed = review.passed,
-                "review result"
-            );
+            info!(node_id, attempt, score = review.score, passed = review.passed, "review result");
 
             // Store review report as artifact
             let report_id = ArtifactId::new();
@@ -412,8 +384,7 @@ impl WorkflowExecutor {
             model: String::new(),
         };
 
-        let mut agent = AgentLoop::new(provider, registry, event_tx, cancel)
-            .with_config(config);
+        let mut agent = AgentLoop::new(provider, registry, event_tx, cancel).with_config(config);
 
         let messages = agent.run(AgentMessage::user(user_message)).await?;
         Ok(NodeOutput::AgentMessages(messages))
@@ -472,44 +443,23 @@ fn parse_review_response(text: &str) -> ReviewParseResult {
     if let Some(json) = json_str
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&json)
     {
-        let score = value
-            .get("score")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5);
+        let score = value.get("score").and_then(|v| v.as_f64()).unwrap_or(0.5);
         let issues = value
             .get("issues")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
         let suggestions = value
             .get("suggestions")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        return ReviewParseResult {
-            score,
-            passed: score >= 0.7,
-            issues,
-            suggestions,
-        };
+        return ReviewParseResult { score, passed: score >= 0.7, issues, suggestions };
     }
 
     // Fallback: treat as passed with moderate score
-    ReviewParseResult {
-        score: 0.7,
-        passed: true,
-        issues: vec![],
-        suggestions: vec![],
-    }
+    ReviewParseResult { score: 0.7, passed: true, issues: vec![], suggestions: vec![] }
 }
 
 /// Try to extract a JSON object from text.
@@ -534,9 +484,12 @@ fn extract_json(text: &str) -> Option<String> {
 /// Get current Unix timestamp as a string.
 fn unix_timestamp() -> String {
     use std::time::SystemTime;
+    // SAFETY: SystemTime::now() is guaranteed to be after UNIX_EPOCH on any
+    // correctly configured system; if a clock skew makes it earlier, panicking
+    // is the desired behavior since we cannot generate a meaningful timestamp.
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is before UNIX_EPOCH")
         .as_secs()
         .to_string()
 }
