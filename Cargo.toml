@@ -87,7 +87,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eventsource-stream = "0.2"
 
 # TOML config
-toml = "0.8"
+toml = "1.1"
 
 # TUI
 ratatui = "0.30"
