@@ -24,8 +24,12 @@
 //! See `docs/architecture/compaction.md` for design rationale and the list
 //! of unimplemented strategies (TruncateStrategy, MapReduceStrategy, etc.).
 
+pub mod file_hints;
 pub mod strategy;
 pub mod summarize;
+pub mod summary_schema;
 
+pub use file_hints::{FileHints, extract_file_hints};
 pub use strategy::{CompactRequest, CompactionStrategy};
 pub use summarize::SummarizeStrategy;
+pub use summary_schema::StructuredSummary;

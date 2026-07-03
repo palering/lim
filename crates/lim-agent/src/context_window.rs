@@ -20,12 +20,14 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use lim_core::error::Result;
 use lim_core::message::{AgentMessage, LlmMessage, Role};
 
 use lim_llm::Provider;
 
-use crate::compaction::{CompactRequest, CompactionStrategy, SummarizeStrategy};
+use crate::compaction::{CompactRequest, CompactionStrategy, StructuredSummary, SummarizeStrategy};
 
 /// Configuration for context window management.
 #[derive(Debug, Clone)]
@@ -95,6 +97,39 @@ pub struct CompactionResult {
     pub summary_prompt_tokens: u64,
     /// Completion tokens reported by the provider for the summarization call.
     pub summary_completion_tokens: u64,
+    /// Structured summary produced by the LLM (Phase 1).
+    ///
+    /// `None` when:
+    /// - `was_compacted` is false (no compaction occurred)
+    /// - the LLM call failed or returned unparseable output (fell back to
+    ///   free-text summary)
+    /// - the strategy is not `SummarizeStrategy` (future strategies may not
+    ///   produce a `StructuredSummary`)
+    ///
+    /// When `Some`, the summary's `read_files` / `modified_files` are
+    /// populated by local extraction (not LLM). The summary text is rendered
+    /// via [`StructuredSummary::render_for_projection`] and inserted as a
+    /// User-role message in `messages`.
+    pub summary: Option<StructuredSummary>,
+    /// What triggered this compaction (Phase 1).
+    ///
+    /// `AutoThreshold` (default) = budget exceeded during pre-send check.
+    /// `Manual` = `compact_now()` called by user.
+    /// `OverflowRecovery` = provider returned context_length_exceeded (Phase 2).
+    pub trigger_reason: CompactionTriggerReason,
+}
+
+/// Why compaction was triggered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTriggerReason {
+    /// Pre-send budget check exceeded (default, existing behavior).
+    #[default]
+    AutoThreshold,
+    /// User-initiated via `compact_now()`.
+    Manual,
+    /// Provider reported context_length_exceeded; reactive recovery (Phase 2).
+    OverflowRecovery,
 }
 
 /// Manages the context window by compacting older messages when approaching
@@ -183,6 +218,8 @@ impl ContextWindowManager {
                 summary_model: String::new(),
                 summary_prompt_tokens: 0,
                 summary_completion_tokens: 0,
+                summary: None,
+                trigger_reason: CompactionTriggerReason::AutoThreshold,
             });
         }
 
