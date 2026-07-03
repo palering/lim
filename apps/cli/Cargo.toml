@@ -7,6 +7,7 @@ edition.workspace = true
 lim-core = { workspace = true }
 lim-llm = { workspace = true }
 lim-agent = { workspace = true }
+lim-config = { workspace = true }
 lim-executor = { workspace = true }
 lim-tools = { workspace = true }
 lim-session = { workspace = true }

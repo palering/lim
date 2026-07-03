@@ -40,10 +40,7 @@ impl ContextEdit {
 
     /// Create an edit that excludes the given message indices.
     pub fn excluding(indices: impl IntoIterator<Item = usize>) -> Self {
-        Self {
-            exclude: indices.into_iter().collect(),
-            replace: Vec::new(),
-        }
+        Self { exclude: indices.into_iter().collect(), replace: Vec::new() }
     }
 
     /// Add an exclusion.
@@ -80,11 +77,8 @@ impl ContextEdit {
 /// The original slice is not modified. Out-of-bounds indices are silently
 /// ignored (the caller should validate beforehand if strict checking is needed).
 pub fn apply_edit(messages: &[AgentMessage], edit: &ContextEdit) -> Vec<AgentMessage> {
-    let replace_map: std::collections::HashMap<usize, &Vec<ContentBlock>> = edit
-        .replace
-        .iter()
-        .map(|(idx, content)| (*idx, content))
-        .collect();
+    let replace_map: std::collections::HashMap<usize, &Vec<ContentBlock>> =
+        edit.replace.iter().map(|(idx, content)| (*idx, content)).collect();
 
     messages
         .iter()
@@ -157,16 +151,15 @@ mod tests {
         let result = apply_edit(&messages, &edit);
         assert_eq!(result.len(), 3);
         // Messages 0, 2, 4 remain
-        assert_eq!(result[0].role, Role::User);   // was index 0
-        assert_eq!(result[1].role, Role::User);   // was index 2
-        assert_eq!(result[2].role, Role::User);   // was index 4
+        assert_eq!(result[0].role, Role::User); // was index 0
+        assert_eq!(result[1].role, Role::User); // was index 2
+        assert_eq!(result[2].role, Role::User); // was index 4
     }
 
     #[test]
     fn replace_changes_content() {
         let messages = make_messages(3);
-        let edit = ContextEdit::none()
-            .replace(1, vec![ContentBlock::text("[summarized]")]);
+        let edit = ContextEdit::none().replace(1, vec![ContentBlock::text("[summarized]")]);
         let result = apply_edit(&messages, &edit);
         assert_eq!(result.len(), 3);
         // Message 1 should have replaced content
@@ -181,8 +174,7 @@ mod tests {
     #[test]
     fn exclude_and_replace_combined() {
         let messages = make_messages(5);
-        let edit = ContextEdit::excluding([0, 4])
-            .replace(2, vec![ContentBlock::text("[edited]")]);
+        let edit = ContextEdit::excluding([0, 4]).replace(2, vec![ContentBlock::text("[edited]")]);
         let result = apply_edit(&messages, &edit);
         assert_eq!(result.len(), 3); // 5 - 2 excluded
         // Index 2 was replaced
@@ -195,8 +187,7 @@ mod tests {
     #[test]
     fn out_of_bounds_indices_ignored() {
         let messages = make_messages(3);
-        let edit = ContextEdit::excluding([10, 20])
-            .replace(99, vec![ContentBlock::text("nope")]);
+        let edit = ContextEdit::excluding([10, 20]).replace(99, vec![ContentBlock::text("nope")]);
         let result = apply_edit(&messages, &edit);
         assert_eq!(result.len(), 3); // nothing changed
     }
@@ -241,8 +232,7 @@ mod tests {
 
     #[test]
     fn context_edit_serde_roundtrip() {
-        let edit = ContextEdit::excluding([1, 3])
-            .replace(2, vec![ContentBlock::text("edited")]);
+        let edit = ContextEdit::excluding([1, 3]).replace(2, vec![ContentBlock::text("edited")]);
         let json = serde_json::to_string(&edit).unwrap();
         let parsed: ContextEdit = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.exclude.len(), 2);

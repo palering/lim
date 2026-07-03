@@ -4,18 +4,28 @@
 //! The core principle: the full `AgentMessage` history is NEVER modified.
 //! Compaction happens only at the `LlmMessage` projection layer, right
 //! before sending to the provider.
+//!
+//! ## Architecture
+//!
+//! [`ContextWindowManager`] owns:
+//! - **Trigger logic**: decides *when* to compact (token budget exceeded).
+//! - **Strategy**: decides *how* to compact (default: [`SummarizeStrategy`]).
+//!
+//! The strategy is pluggable via [`CompactionStrategy`]. Use
+//! [`ContextWindowManager::with_strategy`] to inject a custom strategy
+//! (e.g. remote compactor, cheaper model for summarization, truncate-only).
+//!
+//! [`SummarizeStrategy`]: crate::compaction::SummarizeStrategy
+//! [`CompactionStrategy`]: crate::compaction::CompactionStrategy
 
 use std::sync::Arc;
 
-use futures::StreamExt;
-use tracing::debug;
-
-use lim_core::content::ContentBlock;
 use lim_core::error::Result;
-use lim_core::message::{AgentMessage, LlmMessage, Role, convert_to_llm};
+use lim_core::message::{AgentMessage, LlmMessage, Role};
 
-use lim_llm::provider::{LlmRequest, Provider};
-use lim_llm::stream::StreamEvent;
+use lim_llm::Provider;
+
+use crate::compaction::{CompactRequest, CompactionStrategy, SummarizeStrategy};
 
 /// Configuration for context window management.
 #[derive(Debug, Clone)]
@@ -24,9 +34,15 @@ pub struct ContextConfig {
     pub context_window: u64,
     /// Tokens reserved for model output generation.
     pub max_output_tokens: u64,
-    /// Fraction of available budget that triggers compaction (0.0–1.0).
-    /// Default: 0.8 — compact when usage exceeds 80% of budget.
-    pub trigger_ratio: f64,
+    /// Buffer tokens subtracted from the available budget before triggering
+    /// compaction. Larger values trigger earlier (more headroom for the
+    /// summary call itself + the model's response).
+    ///
+    /// Default: 13_000 — aligned with Claude Code's auto-compact threshold
+    /// (`window - 13000`). With a 200K window: trigger at 187K. With a 1M
+    /// window: trigger at 987K (~98.7%). The buffer grows linearly with the
+    /// model's output capacity, not the window size.
+    pub compact_buffer_tokens: u64,
     /// Number of recent user/assistant exchange pairs to preserve verbatim.
     /// Default: 4.
     pub keep_recent_pairs: usize,
@@ -37,9 +53,22 @@ impl Default for ContextConfig {
         Self {
             context_window: 128_000,
             max_output_tokens: 8_192,
-            trigger_ratio: 0.8,
+            compact_buffer_tokens: 13_000,
             keep_recent_pairs: 4,
         }
+    }
+}
+
+impl ContextConfig {
+    /// Compute the token budget at which compaction triggers.
+    ///
+    /// Formula: `context_window - max_output_tokens - compact_buffer_tokens`.
+    /// When the observed or estimated input token count exceeds this value,
+    /// [`ContextWindowManager::compact`] invokes the strategy.
+    fn auto_compact_threshold(&self) -> u64 {
+        self.context_window
+            .saturating_sub(self.max_output_tokens)
+            .saturating_sub(self.compact_buffer_tokens)
     }
 }
 
@@ -58,6 +87,14 @@ pub struct CompactionResult {
     pub tokens_before: u64,
     /// Estimated token count after compaction.
     pub tokens_after: u64,
+    /// Model used for the hidden summarization LLM call (empty if no
+    /// compaction occurred or summary fell back to verbatim).
+    pub summary_model: String,
+    /// Prompt tokens reported by the provider for the summarization call.
+    /// 0 if no call was made or the provider did not report usage.
+    pub summary_prompt_tokens: u64,
+    /// Completion tokens reported by the provider for the summarization call.
+    pub summary_completion_tokens: u64,
 }
 
 /// Manages the context window by compacting older messages when approaching
@@ -65,32 +102,77 @@ pub struct CompactionResult {
 ///
 /// The full `AgentMessage` history is preserved — compaction only affects
 /// the `LlmMessage` projection sent to the provider.
+///
+/// ## Strategy
+///
+/// Compaction logic is delegated to a [`CompactionStrategy`]. The default
+/// is [`SummarizeStrategy`]; inject a custom one via [`Self::with_strategy`].
 pub struct ContextWindowManager {
     config: ContextConfig,
+    strategy: Box<dyn CompactionStrategy>,
+    /// Last observed real `usage.input_tokens` from the provider (from the
+    /// most recent `TurnEnd` event). `None` until the first turn completes
+    /// or if the provider does not report usage. Used to override the
+    /// character-count heuristic for more accurate trigger decisions.
+    last_known_input_tokens: Option<u64>,
 }
 
 impl ContextWindowManager {
-    /// Create a new context window manager with the given configuration.
+    /// Create a new context window manager with the default
+    /// [`SummarizeStrategy`].
     pub fn new(config: ContextConfig) -> Self {
-        Self { config }
+        Self::with_strategy(config, Box::new(SummarizeStrategy::default()))
+    }
+
+    /// Create a new context window manager with a custom compaction strategy.
+    ///
+    /// Use this to inject e.g. a remote compactor or a `SummarizeStrategy`
+    /// configured with a cheaper model:
+    ///
+    /// ```ignore
+    /// let strategy = SummarizeStrategy::default()
+    ///     .with_provider(small_provider)
+    ///     .with_model("gpt-4o-mini");
+    /// let cwm = ContextWindowManager::with_strategy(
+    ///     config,
+    ///     Box::new(strategy),
+    /// );
+    /// ```
+    pub fn with_strategy(config: ContextConfig, strategy: Box<dyn CompactionStrategy>) -> Self {
+        Self { config, strategy, last_known_input_tokens: None }
+    }
+
+    /// Observe real token usage from the provider after a turn ends.
+    ///
+    /// Called by [`AgentLoop`](crate::agent_loop::AgentLoop) after each
+    /// `TurnEnd` event. The observed value supersedes the character-count
+    /// heuristic for subsequent trigger checks. See P0 fix in
+    /// `docs/architecture/compaction.md`.
+    pub fn observe_usage(&mut self, input_tokens: u64) {
+        self.last_known_input_tokens = Some(input_tokens);
     }
 
     /// Compact the message history to fit within the context window budget.
     ///
-    /// If the estimated token count is within the budget, returns all messages
-    /// converted via `convert_to_llm()`. Otherwise, summarizes older messages
-    /// using the provider and returns a compacted message list.
+    /// If the (observed or estimated) token count is within the budget,
+    /// returns all messages converted via `convert_to_llm()`. Otherwise,
+    /// delegates to the configured [`CompactionStrategy`].
     pub async fn compact(
         &self,
         messages: &[AgentMessage],
         provider: &Arc<dyn Provider>,
         model: &str,
     ) -> Result<CompactionResult> {
-        let tokens_before = estimate_tokens(messages);
-        let budget = self.available_budget();
+        // Prefer the real provider-reported token count when available.
+        // Fall back to the character-count heuristic on the first turn or
+        // when the provider doesn't report usage.
+        let tokens_before =
+            self.last_known_input_tokens.unwrap_or_else(|| estimate_tokens(messages));
+
+        let budget = self.config.auto_compact_threshold();
 
         if tokens_before <= budget {
-            let llm_messages = convert_to_llm(messages);
+            let llm_messages = lim_core::message::convert_to_llm(messages);
             return Ok(CompactionResult {
                 messages_after: messages.len(),
                 messages_before: messages.len(),
@@ -98,253 +180,107 @@ impl ContextWindowManager {
                 tokens_before,
                 messages: llm_messages,
                 was_compacted: false,
+                summary_model: String::new(),
+                summary_prompt_tokens: 0,
+                summary_completion_tokens: 0,
             });
         }
 
-        // Find the split point: system messages + old messages | recent messages
-        let recent_start = self.find_recent_start(messages);
-
-        if recent_start == 0 {
-            // All messages are in the recent window — can't compact further
-            let llm_messages = convert_to_llm(messages);
-            return Ok(CompactionResult {
-                messages_after: messages.len(),
-                messages_before: messages.len(),
-                tokens_after: tokens_before,
-                tokens_before,
-                messages: llm_messages,
-                was_compacted: false,
-            });
-        }
-
-        // Prepare compaction: extract system messages and build summary text
-        let (system_msgs, old_text) = prepare_compaction(&messages[..recent_start]);
-
-        // Generate summary of old messages (if any non-system messages exist)
-        let summary_text = if old_text.is_empty() {
-            String::new()
-        } else {
-            self.summarize(&old_text, Arc::clone(provider), model).await?
+        // Budget exceeded — delegate to the strategy.
+        let req = CompactRequest {
+            messages,
+            config: &self.config,
+            main_provider: provider,
+            main_model: model,
+            observed_input_tokens: self.last_known_input_tokens,
         };
-
-        // Build the compacted message list
-        let mut llm_messages: Vec<LlmMessage> = Vec::new();
-
-        // 1. System messages first
-        for msg in system_msgs {
-            if let Some(llm_msg) = LlmMessage::from_agent_message(msg) {
-                llm_messages.push(llm_msg);
-            }
-        }
-
-        // 2. Summary as a User-role message
-        if !summary_text.is_empty() {
-            llm_messages.push(LlmMessage {
-                role: Role::User,
-                content: vec![ContentBlock::text(format!(
-                    "[Earlier conversation summary]\n{summary_text}\n[End of summary — conversation continues below]"
-                ))],
-                tool_call_ids: vec![],
-            });
-        }
-
-        // 3. Recent messages verbatim
-        for msg in &messages[recent_start..] {
-            if let Some(llm_msg) = LlmMessage::from_agent_message(msg) {
-                llm_messages.push(llm_msg);
-            }
-        }
-
-        let tokens_after = estimate_llm_tokens(&llm_messages);
-
-        debug!(
-            messages_before = messages.len(),
-            messages_after = llm_messages.len(),
-            tokens_before,
-            tokens_after,
-            "context compacted"
-        );
-
-        Ok(CompactionResult {
-            was_compacted: true,
-            messages_before: messages.len(),
-            messages_after: llm_messages.len(),
-            tokens_before,
-            tokens_after,
-            messages: llm_messages,
-        })
+        self.strategy.compact(req).await
     }
 
-    /// Available token budget for input messages.
-    fn available_budget(&self) -> u64 {
-        let available = self.config.context_window.saturating_sub(self.config.max_output_tokens);
-        (available as f64 * self.config.trigger_ratio) as u64
+    /// Read-only access to the configuration.
+    pub fn config(&self) -> &ContextConfig {
+        &self.config
     }
+}
 
-    /// Find the index where the recent conversation window starts.
-    ///
-    /// Scans backward through messages counting User messages to identify
-    /// the last N conversation exchange pairs.
-    fn find_recent_start(&self, messages: &[AgentMessage]) -> usize {
-        let mut user_count = 0;
-        let mut recent_start = messages.len();
+// ── Free helper functions (shared with compaction strategies) ───────────
 
-        for i in (0..messages.len()).rev() {
-            if messages[i].role == Role::User {
-                user_count += 1;
-                if user_count >= self.config.keep_recent_pairs {
-                    recent_start = i;
-                    break;
-                }
-            }
-        }
+/// Find the index where the recent conversation window starts.
+///
+/// Scans backward through messages counting User messages to identify
+/// the last `keep_recent_pairs` conversation exchanges. Adjusts the
+/// boundary to keep tool_call → tool_result pairs together.
+pub fn find_recent_start(messages: &[AgentMessage], keep_recent_pairs: usize) -> usize {
+    let mut user_count = 0;
+    let mut recent_start = messages.len();
 
-        // If we didn't find enough User messages, everything is recent
-        if user_count < self.config.keep_recent_pairs {
-            return 0;
-        }
-
-        // Adjust boundary to keep tool call/result pairs together.
-        // Walk back over consecutive tool-related messages so that
-        // assistant(tool_call) + tool(result) groups are never split.
-        while recent_start > 0 {
-            let prev = &messages[recent_start - 1];
-            if matches!(prev.role, Role::Assistant | Role::Tool)
-                && (prev.role == Role::Tool || prev.has_tool_calls())
-            {
-                recent_start -= 1;
-            } else {
+    for i in (0..messages.len()).rev() {
+        if messages[i].role == Role::User {
+            user_count += 1;
+            if user_count >= keep_recent_pairs {
+                recent_start = i;
                 break;
             }
         }
-
-        recent_start
     }
 
-    /// Generate a summary of older messages using the provider.
-    ///
-    /// Takes pre-formatted conversation text and an owned Arc to the provider.
-    /// The Arc is consumed to enable calling `provider.stream()` via auto-deref.
-    async fn summarize(
-        &self,
-        conversation_text: &str,
-        provider: Arc<dyn Provider>,
-        model: &str,
-    ) -> Result<String> {
-        let summary_prompt = format!(
-            "Summarize the following conversation history concisely. \
-             Preserve: key facts, decisions made, tool outputs, file contents, \
-             and context needed to continue the conversation. \
-             Omit: pleasantries, redundant details.\n\n{conversation_text}"
-        );
-
-        let llm_msg = LlmMessage {
-            role: Role::User,
-            content: vec![ContentBlock::text(summary_prompt)],
-            tool_call_ids: vec![],
-        };
-
-        let request = LlmRequest::new(model, vec![llm_msg]);
-        let stream = provider.stream(request);
-        let events: Vec<_> = collect_stream(stream).await;
-
-        let mut summary = String::new();
-        for event in events {
-            if let Ok(StreamEvent::TextDelta { text }) = event {
-                summary.push_str(&text);
-            }
-        }
-
-        Ok(summary)
+    // If we didn't find enough User messages, everything is recent
+    if user_count < keep_recent_pairs {
+        return 0;
     }
-}
 
-/// Collect a BoxStream of results into a Vec.
-async fn collect_stream<'a>(
-    mut stream: futures::stream::BoxStream<'a, std::result::Result<StreamEvent, lim_llm::ProviderError>>,
-) -> Vec<std::result::Result<StreamEvent, lim_llm::ProviderError>> {
-    let mut events = Vec::new();
-    while let Some(event) = stream.next().await {
-        events.push(event);
-    }
-    events
-}
-
-/// Separate system messages from old messages and build summary text.
-///
-/// Returns `(system_messages, formatted_conversation_text)` where the text
-/// contains all non-system messages formatted for the summarization prompt.
-fn prepare_compaction(messages: &[AgentMessage]) -> (Vec<&AgentMessage>, String) {
-    let mut system = Vec::new();
-    let mut old_lines = Vec::new();
-    for msg in messages {
-        if msg.role == Role::System {
-            system.push(msg);
+    // Adjust boundary to keep tool call/result pairs together.
+    // Walk back over consecutive tool-related messages so that
+    // assistant(tool_call) + tool(result) groups are never split.
+    while recent_start > 0 {
+        let prev = &messages[recent_start - 1];
+        if matches!(prev.role, Role::Assistant | Role::Tool)
+            && (prev.role == Role::Tool || prev.has_tool_calls())
+        {
+            recent_start -= 1;
         } else {
-            old_lines.push(message_to_text(msg));
+            break;
         }
     }
-    (system, old_lines.join("\n\n"))
-}
 
-/// Format a message as human-readable text for the summarization prompt.
-fn message_to_text(msg: &AgentMessage) -> String {
-    let role = match msg.role {
-        Role::System => "System",
-        Role::User => "User",
-        Role::Assistant => "Assistant",
-        Role::Tool => "Tool",
-    };
-    let content: Vec<String> = msg
-        .content
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text { text } => text.clone(),
-            ContentBlock::Thinking { text } => format!("[thinking: {text}]"),
-            ContentBlock::ToolCall { name, arguments, .. } => {
-                format!("[tool_call: {name}({arguments})]")
-            }
-            ContentBlock::Image { mime_type, .. } => {
-                format!("[image: {mime_type}]")
-            }
-            ContentBlock::ArtifactRef { artifact_id, .. } => {
-                format!("[artifact: {artifact_id}]")
-            }
-        })
-        .collect();
-    format!("{role}: {}", content.join(" "))
+    recent_start
 }
 
 /// Estimate the token count for a set of agent messages.
 ///
-/// Uses a simple heuristic: `text_length / 4` per content block plus a small
-/// overhead per message for role markers and JSON structure.
-/// Approximately ±20% accurate for English text.
-fn estimate_tokens(messages: &[AgentMessage]) -> u64 {
+/// Uses a CJK-aware heuristic:
+/// - ASCII / Latin text: ~4 bytes per token (≈ 1 token per word)
+/// - CJK characters (Chinese/Japanese/Korean): ~1.5 tokens per character
+///   (UTF-8 encodes CJK as 3 bytes, but BPE typically produces 1-2 tokens
+///   per character — splitting the difference at 1.5)
+/// - Plus 10 tokens overhead per message for role markers and JSON structure.
+///
+/// Approximately ±20% accurate for English, ±30% for CJK. Used only as a
+/// fallback when [`ContextWindowManager::observe_usage`] has not been
+/// called (i.e. first turn, or provider doesn't report usage).
+pub fn estimate_tokens(messages: &[AgentMessage]) -> u64 {
     let mut total: u64 = 0;
     for msg in messages {
         // Overhead per message: role marker + JSON structure ≈ 10 tokens
         total += 10;
         for block in &msg.content {
             match block {
-                ContentBlock::Text { text } => {
-                    total += (text.len() as u64) / 4;
+                lim_core::content::ContentBlock::Text { text } => {
+                    total += estimate_text_tokens(text);
                 }
-                ContentBlock::Thinking { text } => {
-                    total += (text.len() as u64) / 4;
+                lim_core::content::ContentBlock::Thinking { text } => {
+                    total += estimate_text_tokens(text);
                 }
-                ContentBlock::ToolCall {
-                    name, arguments, ..
-                } => {
-                    total += (name.len() as u64) / 4;
-                    total += (arguments.to_string().len() as u64) / 4;
+                lim_core::content::ContentBlock::ToolCall { name, arguments, .. } => {
+                    total += estimate_text_tokens(name);
+                    total += estimate_text_tokens(&arguments.to_string());
                 }
-                ContentBlock::Image { data, .. } => {
+                lim_core::content::ContentBlock::Image { data, .. } => {
                     // Images are encoded as base64 in API calls
                     total += (data.len() as u64) * 4 / 3 / 4;
                 }
-                ContentBlock::ArtifactRef { label, .. } => {
-                    total += label.as_ref().map_or(5, |l| (l.len() as u64) / 4);
+                lim_core::content::ContentBlock::ArtifactRef { label, .. } => {
+                    total += label.as_ref().map_or(5, |l| estimate_text_tokens(l));
                 }
             }
         }
@@ -353,23 +289,21 @@ fn estimate_tokens(messages: &[AgentMessage]) -> u64 {
 }
 
 /// Estimate tokens for LLM messages (post-conversion).
-fn estimate_llm_tokens(messages: &[LlmMessage]) -> u64 {
+pub fn estimate_llm_tokens(messages: &[LlmMessage]) -> u64 {
     let mut total: u64 = 0;
     for msg in messages {
         total += 10;
         for block in &msg.content {
             match block {
-                ContentBlock::Text { text } => {
-                    total += (text.len() as u64) / 4;
+                lim_core::content::ContentBlock::Text { text } => {
+                    total += estimate_text_tokens(text);
                 }
-                ContentBlock::Thinking { text } => {
-                    total += (text.len() as u64) / 4;
+                lim_core::content::ContentBlock::Thinking { text } => {
+                    total += estimate_text_tokens(text);
                 }
-                ContentBlock::ToolCall {
-                    name, arguments, ..
-                } => {
-                    total += (name.len() as u64) / 4;
-                    total += (arguments.to_string().len() as u64) / 4;
+                lim_core::content::ContentBlock::ToolCall { name, arguments, .. } => {
+                    total += estimate_text_tokens(name);
+                    total += estimate_text_tokens(&arguments.to_string());
                 }
                 _ => {
                     total += 10;
@@ -380,25 +314,57 @@ fn estimate_llm_tokens(messages: &[LlmMessage]) -> u64 {
     total
 }
 
+/// Estimate the token count of a text string.
+///
+/// - ASCII / Latin characters: ~4 chars per token
+/// - CJK characters (Chinese/Japanese/Korean): ~1.5 tokens per char
+fn estimate_text_tokens(text: &str) -> u64 {
+    let mut ascii_chars: u64 = 0;
+    let mut cjk_chars: u64 = 0;
+    for ch in text.chars() {
+        if (ch as u32) < 0x3000 && !('\u{0300}'..='\u{036F}').contains(&ch) {
+            // Basic Latin / digits / punctuation / extended Latin
+            ascii_chars += 1;
+        } else if is_cjk(ch) {
+            // Chinese, Japanese, Korean characters
+            cjk_chars += 1;
+        } else {
+            // Other scripts (Cyrillic, Arabic, emoji, etc.) — treat as ~2 chars per token
+            ascii_chars += 2;
+        }
+    }
+    ascii_chars / 4 + (cjk_chars * 3) / 2
+}
+
+/// Check if a character is CJK (Chinese, Japanese, Korean).
+fn is_cjk(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(code,
+        0x3000..=0x303F |  // CJK Symbols and Punctuation
+        0x3040..=0x309F |  // Hiragana
+        0x30A0..=0x30FF |  // Katakana
+        0x3400..=0x4DBF |  // CJK Extension A
+        0x4E00..=0x9FFF |  // CJK Unified Ideographs
+        0xAC00..=0xD7AF |  // Hangul Syllables
+        0xF900..=0xFAFF    // CJK Compatibility Ideographs
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lim_core::content::ContentBlock;
     use lim_core::id::ToolCallId;
     use lim_llm::mock::{MockProvider, MockResponse};
-    use std::sync::Arc;
 
     // ── Token estimation ──────────────────────────────────────────
 
     #[test]
     fn token_estimation_within_margin() {
-        // ~400 words ≈ ~500 tokens; our heuristic: ~2000/4 = 500 + 10 overhead = 510
         let text = "word ".repeat(400);
         let messages = vec![AgentMessage::user(&text)];
         let tokens = estimate_tokens(&messages);
-        assert!(
-            (400..=650).contains(&tokens),
-            "expected ~500 tokens, got {tokens}"
-        );
+        assert!((400..=650).contains(&tokens), "expected ~500 tokens, got {tokens}");
     }
 
     #[test]
@@ -408,360 +374,147 @@ mod tests {
     }
 
     #[test]
-    fn token_estimation_multiple_messages() {
-        let messages = vec![
-            AgentMessage::user("hello"),
-            AgentMessage::assistant(vec![ContentBlock::text("world")]),
-        ];
+    fn token_estimation_cjk_not_overcounted() {
+        let text = "你好世界".repeat(25); // 100 chars
+        let messages = vec![AgentMessage::user(&text)];
         let tokens = estimate_tokens(&messages);
-        assert!(tokens > 20, "expected > 20 tokens for 2 messages, got {tokens}");
+        assert!(
+            (100..=200).contains(&tokens),
+            "expected ~150 tokens for 100 CJK chars, got {tokens}"
+        );
     }
 
-    // ── Message formatting ────────────────────────────────────────
-
-    #[test]
-    fn message_to_text_user() {
-        let msg = AgentMessage::user("hello world");
-        let text = message_to_text(&msg);
-        assert_eq!(text, "User: hello world");
-    }
-
-    #[test]
-    fn message_to_text_tool_call() {
-        let msg = AgentMessage::assistant(vec![ContentBlock::tool_call(
-            ToolCallId::new(),
-            "bash",
-            serde_json::json!({"cmd": "ls"}),
-        )]);
-        let text = message_to_text(&msg);
-        assert!(text.starts_with("Assistant: [tool_call: bash("));
-    }
-
-    #[test]
-    fn message_to_text_image() {
-        let msg = AgentMessage::assistant(vec![ContentBlock::Image {
-            data: vec![0xFF],
-            mime_type: "image/png".to_string(),
-        }]);
-        let text = message_to_text(&msg);
-        assert_eq!(text, "Assistant: [image: image/png]");
-    }
-
-    // ── Compaction behavior ───────────────────────────────────────
-
-    #[tokio::test]
-    async fn no_compaction_under_threshold() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 100_000,
-            max_output_tokens: 1_000,
-            trigger_ratio: 0.8,
-            keep_recent_pairs: 4,
-        });
-
-        let messages = vec![
-            AgentMessage::user("hello"),
-            AgentMessage::assistant(vec![ContentBlock::text("hi there")]),
-        ];
-
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
-
-        assert!(!result.was_compacted);
-        assert_eq!(result.messages.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn no_compaction_empty_messages() {
-        let cwm = ContextWindowManager::new(ContextConfig::default());
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let result = cwm.compact(&[], &provider, "test-model").await.unwrap();
-
-        assert!(!result.was_compacted);
-        assert_eq!(result.messages.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn no_compaction_single_message() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 100_000,
-            max_output_tokens: 1_000,
-            ..ContextConfig::default()
-        });
-        let messages = vec![AgentMessage::user("hi")];
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
-
-        assert!(!result.was_compacted);
-        assert_eq!(result.messages.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn compaction_preserves_system_messages() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 400,
-            max_output_tokens: 50,
-            trigger_ratio: 0.8,
-            keep_recent_pairs: 1,
-        });
-
-        let mut messages = vec![AgentMessage::system("You are a helpful assistant")];
-        // Add many old exchanges to push us over budget
-        for i in 0..20 {
-            messages.push(AgentMessage::user(format!("old question {i}")));
-            messages.push(AgentMessage::assistant(vec![ContentBlock::text(
-                format!("old answer {i}"),
-            )]));
-        }
-        // Recent exchange
-        messages.push(AgentMessage::user("new question"));
-        messages.push(AgentMessage::assistant(vec![ContentBlock::text("new answer")]));
-
-        let provider: Arc<dyn Provider> =
-            Arc::new(MockProvider::new(vec![MockResponse::Text(
-                "Summary of old conversation".to_string(),
-            )]));
-
-        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
-
-        assert!(result.was_compacted);
-        // First message should be system
-        assert_eq!(result.messages[0].role, Role::System);
-    }
-
-    #[tokio::test]
-    async fn compaction_preserves_recent_pairs() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 400,
-            max_output_tokens: 50,
-            trigger_ratio: 0.8,
-            keep_recent_pairs: 2,
-        });
-
-        let mut messages = Vec::new();
-        for i in 0..20 {
-            messages.push(AgentMessage::user(format!("question {i}")));
-            messages.push(AgentMessage::assistant(vec![ContentBlock::text(
-                format!("answer {i}"),
-            )]));
-        }
-
-        let provider: Arc<dyn Provider> =
-            Arc::new(MockProvider::new(vec![MockResponse::Text(
-                "Summary".to_string(),
-            )]));
-
-        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
-
-        assert!(result.was_compacted);
-        // summary + 2 recent pairs (2 user + 2 assistant = 4 messages) = 5
-        assert_eq!(result.messages.len(), 5);
-        // First is the summary (User role)
-        assert_eq!(result.messages[0].role, Role::User);
-        // Last four are the recent exchanges
-        assert_eq!(result.messages[1].role, Role::User);
-        assert_eq!(result.messages[2].role, Role::Assistant);
-        assert_eq!(result.messages[3].role, Role::User);
-        assert_eq!(result.messages[4].role, Role::Assistant);
-    }
-
-    #[tokio::test]
-    async fn compaction_keeps_tool_pairs_together() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 400,
-            max_output_tokens: 50,
-            trigger_ratio: 0.8,
-            keep_recent_pairs: 1,
-        });
-
-        let tc_id = ToolCallId::new();
-        let mut messages = Vec::new();
-        // Old exchanges to push over budget
-        for i in 0..20 {
-            messages.push(AgentMessage::user(format!("old {i}")));
-            messages.push(AgentMessage::assistant(vec![ContentBlock::text(
-                format!("old answer {i}"),
-            )]));
-        }
-        // Recent: user → assistant(tool_call) → tool_result → assistant(text)
-        messages.push(AgentMessage::user("use the tool"));
-        messages.push(AgentMessage::assistant(vec![
-            ContentBlock::text("let me check"),
-            ContentBlock::tool_call(tc_id.clone(), "bash", serde_json::json!({"cmd": "ls"})),
-        ]));
-        messages.push(AgentMessage::tool_result(tc_id, "file1.txt\nfile2.txt", false));
-        messages.push(AgentMessage::assistant(vec![ContentBlock::text(
-            "I found two files",
-        )]));
-
-        let provider: Arc<dyn Provider> =
-            Arc::new(MockProvider::new(vec![MockResponse::Text(
-                "Summary of old stuff".to_string(),
-            )]));
-
-        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
-
-        assert!(result.was_compacted);
-        // The assistant(tool_call) + tool_result pair must not be split
-        let has_tool_call = result.messages.iter().any(|m| {
-            m.role == Role::Assistant
-                && m.content.iter().any(|c| c.is_tool_call())
-        });
-        let has_tool_result = result.messages.iter().any(|m| m.role == Role::Tool);
-        // If tool call is present, tool result must also be present
-        if has_tool_call {
-            assert!(
-                has_tool_result,
-                "tool_call without tool_result — pair was split!"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn compaction_generates_summary_via_provider() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 400,
-            max_output_tokens: 50,
-            trigger_ratio: 0.8,
-            keep_recent_pairs: 1,
-        });
-
-        let mut messages = Vec::new();
-        for i in 0..20 {
-            messages.push(AgentMessage::user(format!("question {i}")));
-            messages.push(AgentMessage::assistant(vec![ContentBlock::text(
-                format!("answer {i}"),
-            )]));
-        }
-        messages.push(AgentMessage::user("latest"));
-        messages.push(AgentMessage::assistant(vec![ContentBlock::text("response")]));
-
-        let provider: Arc<dyn Provider> =
-            Arc::new(MockProvider::new(vec![MockResponse::Text(
-                "The user asked many questions and got many answers.".to_string(),
-            )]));
-
-        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
-
-        assert!(result.was_compacted);
-        // Summary is the first message
-        match &result.messages[0].content[0] {
-            ContentBlock::Text { text } => {
-                assert!(
-                    text.contains("[Earlier conversation summary]"),
-                    "expected summary marker, got: {text}"
-                );
-                assert!(
-                    text.contains("many questions"),
-                    "expected summary content, got: {text}"
-                );
-                assert!(
-                    text.contains("[End of summary"),
-                    "expected end marker, got: {text}"
-                );
-            }
-            _ => panic!("expected text content in summary"),
-        }
-    }
-
-    #[tokio::test]
-    async fn compaction_reduces_token_count() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 400,
-            max_output_tokens: 50,
-            trigger_ratio: 0.8,
-            keep_recent_pairs: 1,
-        });
-
-        let mut messages = Vec::new();
-        for _i in 0..20 {
-            messages.push(AgentMessage::user("word ".repeat(100)));
-            messages.push(AgentMessage::assistant(vec![ContentBlock::text(
-                "reply ".repeat(100),
-            )]));
-        }
-        messages.push(AgentMessage::user("final"));
-        messages.push(AgentMessage::assistant(vec![ContentBlock::text("done")]));
-
-        let provider: Arc<dyn Provider> =
-            Arc::new(MockProvider::new(vec![MockResponse::Text(
-                "Brief summary".to_string(),
-            )]));
-
-        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
-
-        assert!(result.was_compacted);
-        assert!(result.tokens_after < result.tokens_before);
-        assert!(result.messages_after < result.messages_before);
-    }
-
-    #[tokio::test]
-    async fn compaction_few_user_messages_than_pairs() {
-        // When there are fewer User messages than keep_recent_pairs,
-        // no compaction should happen (everything is "recent").
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 1_000,
-            max_output_tokens: 100,
-            trigger_ratio: 0.8,
-            keep_recent_pairs: 10,
-        });
-
-        let messages = vec![
-            AgentMessage::user("only one question"),
-            AgentMessage::assistant(vec![ContentBlock::text("only one answer")]),
-        ];
-
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
-
-        // Can't compact: all messages are "recent" (fewer pairs than keep_recent_pairs)
-        assert!(!result.was_compacted);
-        assert_eq!(result.messages.len(), 2);
-    }
+    // ── Trigger / budget logic ────────────────────────────────────
 
     #[test]
     fn default_config_values() {
         let config = ContextConfig::default();
         assert_eq!(config.context_window, 128_000);
         assert_eq!(config.max_output_tokens, 8_192);
-        assert!((config.trigger_ratio - 0.8).abs() < f64::EPSILON);
+        assert_eq!(config.compact_buffer_tokens, 13_000);
         assert_eq!(config.keep_recent_pairs, 4);
     }
 
     #[test]
-    fn available_budget_calculation() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 100_000,
-            max_output_tokens: 10_000,
-            trigger_ratio: 0.8,
+    fn auto_compact_threshold_subtracts_buffer() {
+        let config = ContextConfig {
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            compact_buffer_tokens: 13_000,
             keep_recent_pairs: 4,
-        });
-        // (100_000 - 10_000) * 0.8 = 72_000
-        assert_eq!(cwm.available_budget(), 72_000);
+        };
+        // 200_000 - 8_192 - 13_000 = 178_808
+        assert_eq!(config.auto_compact_threshold(), 178_808);
     }
 
     #[test]
-    fn find_recent_start_with_tool_chain() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            context_window: 128_000,
+    fn auto_compact_threshold_clamps_to_zero() {
+        // When buffer + output > window, threshold is 0 (always compact).
+        let config = ContextConfig {
+            context_window: 10_000,
+            max_output_tokens: 8_000,
+            compact_buffer_tokens: 5_000,
+            keep_recent_pairs: 4,
+        };
+        // 10_000 - 8_000 - 5_000 = -3_000 → saturating_sub → 0
+        assert_eq!(config.auto_compact_threshold(), 0);
+    }
+
+    // ── observe_usage → trigger decision ─────────────────────────
+
+    #[tokio::test]
+    async fn compact_uses_observed_tokens_when_available() {
+        // Observed tokens above threshold triggers compaction, even when
+        // the heuristic estimate would be below.
+        let mut cwm = ContextWindowManager::new(ContextConfig {
+            context_window: 200_000,
             max_output_tokens: 8_192,
-            trigger_ratio: 0.8,
+            compact_buffer_tokens: 13_000,
+            keep_recent_pairs: 1,
+        });
+        // Threshold = 178_808. Report observed usage above it.
+        cwm.observe_usage(190_000);
+
+        let mut messages = Vec::new();
+        for i in 0..30 {
+            messages.push(AgentMessage::user(format!("q{i}")));
+            messages.push(AgentMessage::assistant(vec![ContentBlock::text(format!("a{i}"))]));
+        }
+        messages.push(AgentMessage::user("latest"));
+        messages.push(AgentMessage::assistant(vec![ContentBlock::text("resp")]));
+
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::new(vec![MockResponse::Text("summary".to_string())]));
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
+
+        assert!(result.was_compacted);
+    }
+
+    #[tokio::test]
+    async fn compact_no_trigger_when_observed_under_budget() {
+        let mut cwm = ContextWindowManager::new(ContextConfig {
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            compact_buffer_tokens: 13_000,
+            keep_recent_pairs: 4,
+        });
+        cwm.observe_usage(50_000); // well below threshold 178_808
+
+        let messages = vec![
+            AgentMessage::user("hi"),
+            AgentMessage::assistant(vec![ContentBlock::text("hello")]),
+        ];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
+
+        assert!(!result.was_compacted);
+    }
+
+    #[tokio::test]
+    async fn compact_falls_back_to_heuristic_without_observed_usage() {
+        // No observe_usage() call — heuristic estimate must drive the decision.
+        let cwm = ContextWindowManager::new(ContextConfig {
+            context_window: 400,
+            max_output_tokens: 50,
+            compact_buffer_tokens: 0,
             keep_recent_pairs: 1,
         });
 
+        let mut messages = Vec::new();
+        for i in 0..20 {
+            messages.push(AgentMessage::user(format!("old q{i}")));
+            messages.push(AgentMessage::assistant(vec![ContentBlock::text(format!("old a{i}"))]));
+        }
+        messages.push(AgentMessage::user("recent"));
+        messages.push(AgentMessage::assistant(vec![ContentBlock::text("resp")]));
+
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::new(vec![MockResponse::Text("summary".to_string())]));
+        let result = cwm.compact(&messages, &provider, "test-model").await.unwrap();
+
+        // Heuristic estimate should exceed the tiny 350-token budget → trigger.
+        assert!(result.was_compacted);
+    }
+
+    // ── find_recent_start ────────────────────────────────────────
+
+    #[test]
+    fn find_recent_start_with_tool_chain() {
         let tc_id = ToolCallId::new();
         let messages = vec![
-            AgentMessage::system("sys"),                  // 0
-            AgentMessage::user("old q"),                  // 1
+            AgentMessage::system("sys"),                                // 0
+            AgentMessage::user("old q"),                                // 1
             AgentMessage::assistant(vec![ContentBlock::text("old a")]), // 2
-            AgentMessage::user("use tool"),                // 3
-            AgentMessage::assistant(vec![                 // 4
+            AgentMessage::user("use tool"),                             // 3
+            AgentMessage::assistant(vec![
+                // 4
                 ContentBlock::tool_call(tc_id.clone(), "bash", serde_json::json!({})),
             ]),
             AgentMessage::tool_result(tc_id, "ok", false), // 5
             AgentMessage::assistant(vec![ContentBlock::text("done")]), // 6
         ];
 
-        let start = cwm.find_recent_start(&messages);
+        let start = find_recent_start(&messages, 1);
         // keep_recent_pairs=1, so we look for 1 User message from the end.
         // Scanning back: messages[3] is User → recent_start = 3.
         // Boundary adjustment: messages[2] is Assistant without tool_calls → stop.
@@ -769,43 +522,12 @@ mod tests {
     }
 
     #[test]
-    fn find_recent_start_preserves_tool_boundary() {
-        let cwm = ContextWindowManager::new(ContextConfig {
-            keep_recent_pairs: 1,
-            ..ContextConfig::default()
-        });
-
-        let tc_id = ToolCallId::new();
-        // Scenario: recent_start lands on a Tool message
+    fn find_recent_start_returns_zero_when_insufficient_pairs() {
         let messages = vec![
-            AgentMessage::user("old"),                     // 0
-            AgentMessage::assistant(vec![ContentBlock::text("old a")]), // 1
-            AgentMessage::user("tool please"),             // 2
-            AgentMessage::assistant(vec![                 // 3
-                ContentBlock::tool_call(tc_id.clone(), "bash", serde_json::json!({})),
-            ]),
-            AgentMessage::tool_result(tc_id, "ok", false), // 4
-            AgentMessage::assistant(vec![ContentBlock::text("done")]), // 5
+            AgentMessage::user("only one"),
+            AgentMessage::assistant(vec![ContentBlock::text("reply")]),
         ];
-
-        let start = cwm.find_recent_start(&messages);
-        // Scanning back: messages[2] is User → recent_start = 2.
-        // Boundary adjustment: messages[1] is Assistant without tool_calls → stop.
-        // recent_start = 2, which starts at User("tool please").
-        // The full chain [2,3,4,5] is kept together.
-        assert_eq!(start, 2);
-    }
-
-    #[test]
-    fn prepare_compaction_works() {
-        let messages = vec![
-            AgentMessage::system("be helpful"),
-            AgentMessage::user("hi"),
-            AgentMessage::assistant(vec![ContentBlock::text("hello")]),
-        ];
-        let (system, old_text) = prepare_compaction(&messages);
-        assert_eq!(system.len(), 1);
-        assert!(old_text.contains("User: hi"));
-        assert!(old_text.contains("Assistant: hello"));
+        // keep_recent_pairs=4 but only 1 User message → 0 (all recent)
+        assert_eq!(find_recent_start(&messages, 4), 0);
     }
 }

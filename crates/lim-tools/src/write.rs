@@ -14,6 +14,7 @@ pub struct WriteFileTool {
 }
 
 impl WriteFileTool {
+    /// Create a new [`WriteFileTool`] backed by the given executor.
     pub fn new(executor: Arc<dyn Executor>) -> Self {
         Self { executor }
     }
@@ -57,29 +58,18 @@ impl Tool for WriteFileTool {
     ) -> ToolFuture<Result<ToolResult>> {
         let executor = Arc::clone(&self.executor);
         Box::pin(async move {
-            let path_str = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| LimError::ToolExecution {
-                    name: "write".to_string(),
-                    message: "missing required argument: path".to_string(),
-                })?;
+            let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                LimError::tool_execution_msg("write", "missing required argument: path")
+            })?;
 
-            let content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| LimError::ToolExecution {
-                    name: "write".to_string(),
-                    message: "missing required argument: content".to_string(),
-                })?;
+            let content = args.get("content").and_then(|v| v.as_str()).ok_or_else(|| {
+                LimError::tool_execution_msg("write", "missing required argument: content")
+            })?;
 
             let path = Utf8PathBuf::from(path_str);
             executor.write_file_atomic(&path, content.as_bytes()).await?;
 
-            Ok(ToolResult::success(
-                tool_call_id,
-                format!("Successfully wrote to {path_str}"),
-            ))
+            Ok(ToolResult::success(tool_call_id, format!("Successfully wrote to {path_str}")))
         })
     }
 }

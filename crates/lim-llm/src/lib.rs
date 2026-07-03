@@ -21,7 +21,7 @@ pub use mock::{MockProvider, MockResponse, MockToolCall};
 pub use model::{ModelId, ModelMetadata};
 pub use provider::{LlmRequest, Provider};
 pub use providers::{
-    create_provider, AnthropicProvider, LimConfig, OpenAiChatProvider,
-    OpenAiResponsesProvider, ProviderInstanceConfig, ProviderType,
+    AnthropicProvider, LimConfig, OpenAiChatProvider, OpenAiResponsesProvider,
+    ProviderInstanceConfig, ProviderType, create_provider,
 };
 pub use stream::StreamEvent;

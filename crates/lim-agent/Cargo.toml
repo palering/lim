@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 lim-core = { workspace = true }
 lim-llm = { workspace = true }
+lim-skills = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
@@ -13,8 +14,13 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 jsonschema = { workspace = true }
+camino = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
 
 [dev-dependencies]
 # `test-util` enables `#[tokio::test(start_paused = true)]` so retry-backoff
 # tests run instantly via the mocked clock.
 tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"

@@ -8,7 +8,8 @@ use lim_core::error::{LimError, Result};
 use lim_core::guard::{ToolGuard, TrustLevel};
 
 use crate::executor::{
-    CommandOutput, CommandSpec, EditReport, Executor, ExecutorCapabilities, ExecutorFuture, FileEdit,
+    CommandOutput, CommandSpec, EditReport, Executor, ExecutorCapabilities, ExecutorFuture,
+    FileEdit,
 };
 use crate::policy::{DefaultPolicy, PermissionPolicy};
 
@@ -24,9 +25,7 @@ pub struct LocalExecutor {
 impl LocalExecutor {
     /// Create a local executor with the given permission policy.
     pub fn new(policy: DefaultPolicy) -> Self {
-        Self {
-            policy: Arc::new(policy),
-        }
+        Self { policy: Arc::new(policy) }
     }
 
     /// Create a workspace-scoped local executor.
@@ -43,7 +42,9 @@ impl LocalExecutor {
     /// Create a permissive local executor (allows everything).
     ///
     /// Deprecated for production use — prefer `LocalExecutor::workspace(vec![cwd])`.
-    #[deprecated(note = "permissive executor allows everything; use `workspace(vec![root])` for production")]
+    #[deprecated(
+        note = "permissive executor allows everything; use `workspace(vec![root])` for production"
+    )]
     #[allow(deprecated)]
     pub fn permissive() -> Self {
         Self::new(DefaultPolicy::permissive())
@@ -63,12 +64,9 @@ impl Executor for LocalExecutor {
         Box::pin(async move {
             policy.check_path(&path)?;
             debug!(%path, "reading file");
-            tokio::fs::read(path.as_std_path())
-                .await
-                .map_err(|e| LimError::ToolExecution {
-                    name: "read".to_string(),
-                    message: format!("failed to read `{path}`: {e}"),
-                })
+            tokio::fs::read(path.as_std_path()).await.map_err(|e| {
+                LimError::tool_execution("read", format!("failed to read `{path}`: {e}"), e)
+            })
         })
     }
 
@@ -84,45 +82,40 @@ impl Executor for LocalExecutor {
             if let Some(parent) = path.parent()
                 && !parent.as_std_path().exists()
             {
-                tokio::fs::create_dir_all(parent.as_std_path())
-                    .await
-                    .map_err(|e| LimError::ToolExecution {
-                        name: "write".to_string(),
-                        message: format!("failed to create parent dirs for `{path}`: {e}"),
-                    })?;
+                tokio::fs::create_dir_all(parent.as_std_path()).await.map_err(|e| {
+                    LimError::tool_execution(
+                        "write",
+                        format!("failed to create parent dirs for `{path}`: {e}"),
+                        e,
+                    )
+                })?;
             }
 
             // Write to a temporary file in the same directory, then rename
             let parent = path.parent().unwrap_or(Utf8Path::new("."));
             let temp_path = parent.join(format!(".lim-tmp-{}", ulid::Ulid::new()));
 
-            tokio::fs::write(temp_path.as_std_path(), &bytes)
-                .await
-                .map_err(|e| LimError::ToolExecution {
-                    name: "write".to_string(),
-                    message: format!("failed to write temp file: {e}"),
-                })?;
+            tokio::fs::write(temp_path.as_std_path(), &bytes).await.map_err(|e| {
+                LimError::tool_execution("write", format!("failed to write temp file: {e}"), e)
+            })?;
 
             // fsync the temp file
-            let file = tokio::fs::File::open(temp_path.as_std_path())
-                .await
-                .map_err(|e| LimError::ToolExecution {
-                    name: "write".to_string(),
-                    message: format!("failed to open temp file for fsync: {e}"),
-                })?;
-            file.sync_all().await.map_err(|e| LimError::ToolExecution {
-                name: "write".to_string(),
-                message: format!("fsync failed: {e}"),
+            let file = tokio::fs::File::open(temp_path.as_std_path()).await.map_err(|e| {
+                LimError::tool_execution(
+                    "write",
+                    format!("failed to open temp file for fsync: {e}"),
+                    e,
+                )
             })?;
+            file.sync_all()
+                .await
+                .map_err(|e| LimError::tool_execution("write", format!("fsync failed: {e}"), e))?;
             drop(file);
 
             // Atomic rename
-            tokio::fs::rename(temp_path.as_std_path(), path.as_std_path())
-                .await
-                .map_err(|e| LimError::ToolExecution {
-                    name: "write".to_string(),
-                    message: format!("atomic rename failed: {e}"),
-                })?;
+            tokio::fs::rename(temp_path.as_std_path(), path.as_std_path()).await.map_err(|e| {
+                LimError::tool_execution("write", format!("atomic rename failed: {e}"), e)
+            })?;
 
             Ok(())
         })
@@ -134,11 +127,13 @@ impl Executor for LocalExecutor {
             policy.check_path(&edit.path)?;
             debug!(path = %edit.path, "applying edit");
 
-            let content = tokio::fs::read_to_string(edit.path.as_std_path())
-                .await
-                .map_err(|e| LimError::ToolExecution {
-                    name: "edit".to_string(),
-                    message: format!("failed to read `{}`: {e}", edit.path),
+            let content =
+                tokio::fs::read_to_string(edit.path.as_std_path()).await.map_err(|e| {
+                    LimError::tool_execution(
+                        "edit",
+                        format!("failed to read `{}`: {e}", edit.path),
+                        e,
+                    )
                 })?;
 
             if !content.contains(&edit.old_string) {
@@ -168,38 +163,33 @@ impl Executor for LocalExecutor {
             if let Some(parent) = edit.path.parent()
                 && !parent.as_std_path().exists()
             {
-                tokio::fs::create_dir_all(parent.as_std_path())
-                    .await
-                    .map_err(|e| LimError::ToolExecution {
-                        name: "write".to_string(),
-                        message: format!("failed to create parent dirs: {e}"),
-                    })?;
+                tokio::fs::create_dir_all(parent.as_std_path()).await.map_err(|e| {
+                    LimError::tool_execution(
+                        "write",
+                        format!("failed to create parent dirs: {e}"),
+                        e,
+                    )
+                })?;
             }
             let parent = edit.path.parent().unwrap_or(Utf8Path::new("."));
             let temp_path = parent.join(format!(".lim-tmp-{}", ulid::Ulid::new()));
-            tokio::fs::write(temp_path.as_std_path(), new_content.as_bytes())
-                .await
-                .map_err(|e| LimError::ToolExecution {
-                    name: "write".to_string(),
-                    message: format!("failed to write temp file: {e}"),
-                })?;
-            let file = tokio::fs::File::open(temp_path.as_std_path())
-                .await
-                .map_err(|e| LimError::ToolExecution {
-                    name: "write".to_string(),
-                    message: format!("failed to open temp file for fsync: {e}"),
-                })?;
-            file.sync_all().await.map_err(|e| LimError::ToolExecution {
-                name: "write".to_string(),
-                message: format!("fsync failed: {e}"),
+            tokio::fs::write(temp_path.as_std_path(), new_content.as_bytes()).await.map_err(
+                |e| LimError::tool_execution("write", format!("failed to write temp file: {e}"), e),
+            )?;
+            let file = tokio::fs::File::open(temp_path.as_std_path()).await.map_err(|e| {
+                LimError::tool_execution(
+                    "write",
+                    format!("failed to open temp file for fsync: {e}"),
+                    e,
+                )
             })?;
-            drop(file);
-            tokio::fs::rename(temp_path.as_std_path(), edit.path.as_std_path())
+            file.sync_all()
                 .await
-                .map_err(|e| LimError::ToolExecution {
-                    name: "write".to_string(),
-                    message: format!("atomic rename failed: {e}"),
-                })?;
+                .map_err(|e| LimError::tool_execution("write", format!("fsync failed: {e}"), e))?;
+            drop(file);
+            tokio::fs::rename(temp_path.as_std_path(), edit.path.as_std_path()).await.map_err(
+                |e| LimError::tool_execution("write", format!("atomic rename failed: {e}"), e),
+            )?;
 
             Ok(EditReport {
                 applied: true,
@@ -233,7 +223,8 @@ impl Executor for LocalExecutor {
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
 
-            // Create a new process group so we can kill the whole group on cancel
+            // Platform-specific process group setup so we can kill the
+            // entire process tree (including grandchildren) on cancel.
             #[cfg(unix)]
             {
                 #[allow(unused_imports)]
@@ -245,10 +236,22 @@ impl Executor for LocalExecutor {
                     });
                 }
             }
+            #[cfg(windows)]
+            {
+                // CREATE_NEW_PROCESS_GROUP (0x00000200) lets us send
+                // CTRL_BREAK_EVENT to the group; combined with `taskkill /T`
+                // on cancel, this ensures the whole tree is terminated.
+                use std::os::windows::process::CommandExt as _;
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+            }
 
-            let mut child = cmd.spawn().map_err(|e| LimError::ToolExecution {
-                name: "bash".to_string(),
-                message: format!("failed to spawn `{}`: {e}", command.command),
+            let mut child = cmd.spawn().map_err(|e| {
+                LimError::tool_execution(
+                    "shell",
+                    format!("failed to spawn `{}`: {e}", command.command),
+                    e,
+                )
             })?;
 
             let child_id = child.id().unwrap_or(0);
@@ -283,10 +286,7 @@ impl Executor for LocalExecutor {
 
             if was_cancelled {
                 warn!(child_id, "cancelling command");
-                #[cfg(unix)]
-                unsafe {
-                    libc::killpg(child_id as i32, libc::SIGTERM);
-                }
+                kill_process_tree(child_id);
                 // Give it a moment to clean up, then force kill
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 let _ = child.kill().await;
@@ -304,33 +304,68 @@ impl Executor for LocalExecutor {
                     err_msg.push('\n');
                 }
                 err_msg.push_str("[Command interrupted by user]");
-                Ok(CommandOutput {
-                    stdout,
-                    stderr: err_msg,
-                    exit_code: -1,
-                })
+                Ok(CommandOutput { stdout, stderr: err_msg, exit_code: -1 })
             } else {
-                let exit_code = child
-                    .try_wait()
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.code())
-                    .unwrap_or(-1);
-                Ok(CommandOutput {
-                    stdout,
-                    stderr,
-                    exit_code,
-                })
+                let exit_code =
+                    child.try_wait().ok().flatten().and_then(|s| s.code()).unwrap_or(-1);
+                Ok(CommandOutput { stdout, stderr, exit_code })
             }
         })
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
-        ExecutorCapabilities {
-            supports_files: true,
-            supports_commands: true,
-            is_sandboxed: false,
+        ExecutorCapabilities { supports_files: true, supports_commands: true, is_sandboxed: false }
+    }
+}
+
+/// Kill an entire process tree rooted at `pid`.
+///
+/// - **Unix**: send `SIGTERM` to the process group (`killpg`). The group was
+///   created via `setpgid(0, 0)` in `pre_exec`, so all descendants are in it.
+/// - **Windows**: run `taskkill /T /F /PID <pid>`, which terminates the
+///   process and its entire child tree. This is the standard Windows idiom
+///   for killing a process tree without Job Objects (simpler, no unsafe).
+///
+/// Best-effort: errors are logged, not returned. The caller follows up
+/// with `child.kill()` as a fallback.
+fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        // Safety: killpg with a positive pid is signal delivery, no UB.
+        let ret = unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
+        if ret != 0 {
+            warn!(pid, errno = ret, "killpg SIGTERM failed");
         }
+    }
+
+    #[cfg(windows)]
+    {
+        // `taskkill /T /F /PID <pid>`:
+        //   /T  - terminate child processes (tree)
+        //   /F  - force (no graceful shutdown)
+        // We spawn this synchronously because it returns quickly and
+        // doing it async would complicate the cancel path for no benefit.
+        let output = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                debug!(pid, "taskkill terminated process tree");
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                warn!(pid, %stderr, "taskkill returned non-zero status");
+            }
+            Err(e) => {
+                warn!(pid, error = %e, "failed to spawn taskkill");
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        warn!("kill_process_tree not implemented on this platform");
     }
 }
 
@@ -368,9 +403,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = Utf8PathBuf::try_from(dir.join("edit-test.txt")).unwrap();
 
-        exec.write_file_atomic(&path, b"hello world")
-            .await
-            .unwrap();
+        exec.write_file_atomic(&path, b"hello world").await.unwrap();
 
         let edit = FileEdit {
             path: path.clone(),
@@ -418,5 +451,72 @@ mod tests {
         };
         let output = exec.run_command(spec, cancel).await.unwrap();
         assert!(!output.is_success());
+    }
+
+    #[tokio::test]
+    async fn cancel_long_running_command() {
+        let exec = test_executor();
+        let cancel = CancellationToken::new();
+        let spec = CommandSpec {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            env: Default::default(),
+            timeout_secs: 60,
+        };
+
+        // Run in a spawned task so we can cancel concurrently
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { exec.run_command(spec, cancel_clone).await });
+
+        // Give the command time to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+
+        let output = handle.await.unwrap().unwrap();
+        assert_eq!(output.exit_code, -1);
+        assert!(output.stderr.contains("interrupted"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_child_processes() {
+        // Verify that cancelling a command also kills its child processes
+        // (process group kill). We spawn a shell that creates a temp file,
+        // sleeps, then deletes it. If cancel kills the whole group, the
+        // temp file will NOT be deleted (sleep was killed before delete).
+        let exec = test_executor();
+        let cancel = CancellationToken::new();
+        let tmp = std::env::temp_dir().join("lim-cancel-test-child");
+        let _ = std::fs::remove_file(&tmp);
+
+        let spec = CommandSpec {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("touch {} && sleep 30 && rm {}", tmp.display(), tmp.display()),
+            ],
+            cwd: None,
+            env: Default::default(),
+            timeout_secs: 60,
+        };
+
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { exec.run_command(spec, cancel_clone).await });
+
+        // Wait for touch to create the file
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(tmp.exists(), "temp file should exist after touch");
+
+        cancel.cancel();
+        let _ = handle.await;
+
+        // Wait a bit to let any surviving `rm` complete
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // If process group kill worked, `sleep` and `rm` were both killed,
+        // so the file still exists.
+        assert!(tmp.exists(), "temp file should still exist (rm was killed)");
+        let _ = std::fs::remove_file(&tmp);
     }
 }

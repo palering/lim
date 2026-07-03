@@ -26,6 +26,7 @@ pub struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    /// Create an empty [`StreamAccumulator`].
     pub fn new() -> Self {
         Self {
             text: String::new(),
@@ -76,18 +77,16 @@ impl StreamAccumulator {
                 // update the name instead of creating a duplicate.
                 if let Some(entry) = self.tool_calls.iter_mut().find(|(tid, _, _)| *tid == id) {
                     if entry.1.is_empty()
-                        && let Some(n) = name {
-                            entry.1 = n;
-                        }
+                        && let Some(n) = name
+                    {
+                        entry.1 = n;
+                    }
                 } else {
                     self.tool_calls.push((id, name.unwrap_or_default(), String::new()));
                 }
                 None
             }
-            StreamEvent::ToolCallDelta {
-                id,
-                arguments_delta,
-            } => {
+            StreamEvent::ToolCallDelta { id, arguments_delta } => {
                 // Find the matching tool call and append the delta
                 if let Some(entry) = self.tool_calls.iter_mut().find(|(tid, _, _)| *tid == id) {
                     entry.2.push_str(&arguments_delta);
@@ -118,15 +117,24 @@ impl StreamAccumulator {
         }
 
         for (id, name, args_str) in self.tool_calls {
-            let arguments = serde_json::from_str(&args_str).unwrap_or({
-                // If JSON parsing failed, wrap the raw string as an error value
-                serde_json::Value::String(args_str)
-            });
-            content.push(ContentBlock::ToolCall {
-                id,
-                name,
-                arguments,
-            });
+            let arguments = match serde_json::from_str(&args_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    // LLM returned malformed JSON arguments for this tool call.
+                    // We fall back to wrapping the raw string as a Value::String
+                    // so the tool still receives *something*, but log a warning
+                    // so silent degradation is observable.
+                    tracing::warn!(
+                        tool_call_id = %id,
+                        tool_name = %name,
+                        args_len = args_str.len(),
+                        error = %e,
+                        "tool call arguments JSON parse failed, falling back to raw string"
+                    );
+                    serde_json::Value::String(args_str)
+                }
+            };
+            content.push(ContentBlock::ToolCall { id, name, arguments });
         }
 
         let msg_id = self.message_id.unwrap_or_default();
@@ -166,16 +174,10 @@ mod tests {
     #[test]
     fn accumulate_text_only() {
         let mut acc = StreamAccumulator::new();
-        acc.ingest(StreamEvent::TextDelta {
-            text: "Hello ".to_string(),
-        });
-        acc.ingest(StreamEvent::TextDelta {
-            text: "world!".to_string(),
-        });
+        acc.ingest(StreamEvent::TextDelta { text: "Hello ".to_string() });
+        acc.ingest(StreamEvent::TextDelta { text: "world!".to_string() });
         acc.ingest(StreamEvent::Usage(Usage::new(10, 20)));
-        acc.ingest(StreamEvent::Done {
-            stop_reason: StopReason::EndTurn,
-        });
+        acc.ingest(StreamEvent::Done { stop_reason: StopReason::EndTurn });
 
         let (msg, usage, reason) = acc.into_message();
         assert_eq!(msg.content.len(), 1);
@@ -191,9 +193,7 @@ mod tests {
     fn accumulate_tool_call() {
         let tc_id = ToolCallId::new();
         let mut acc = StreamAccumulator::new();
-        acc.ingest(StreamEvent::TextDelta {
-            text: "Let me check".to_string(),
-        });
+        acc.ingest(StreamEvent::TextDelta { text: "Let me check".to_string() });
         acc.ingest(StreamEvent::ToolCallStart {
             id: tc_id.clone(),
             name: Some("bash".to_string()),
@@ -202,9 +202,7 @@ mod tests {
             id: tc_id.clone(),
             arguments_delta: "{\"cmd\":\"ls\"}".to_string(),
         });
-        acc.ingest(StreamEvent::Done {
-            stop_reason: StopReason::ToolCall,
-        });
+        acc.ingest(StreamEvent::Done { stop_reason: StopReason::ToolCall });
 
         let (msg, _, reason) = acc.into_message();
         assert_eq!(msg.content.len(), 2);

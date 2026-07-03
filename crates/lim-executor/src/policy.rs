@@ -49,7 +49,9 @@ impl DefaultPolicy {
     /// Create a permissive policy (allows everything). Use only for testing.
     ///
     /// Deprecated for production use — prefer `DefaultPolicy::new(vec![cwd])`.
-    #[deprecated(note = "permissive policy allows everything; use `new(vec![workspace])` for production")]
+    #[deprecated(
+        note = "permissive policy allows everything; use `new(vec![workspace])` for production"
+    )]
     pub fn permissive() -> Self {
         Self {
             workspace_roots: Vec::new(),
@@ -71,31 +73,18 @@ impl DefaultPolicy {
             && let Some(parent) = std_path.parent()
         {
             let canon = std::fs::canonicalize(parent).map_err(|e| {
-                LimError::ToolExecution {
-                    name: "policy".to_string(),
-                    message: format!("cannot resolve parent path: {e}"),
-                }
+                LimError::tool_execution("policy", format!("cannot resolve parent path: {e}"), e)
             })?;
-            let file_name = path
-                .file_name()
-                .unwrap_or_default();
-            return Utf8PathBuf::from_path_buf(canon.join(file_name))
-                .map_err(|_| {
-                    LimError::ToolExecution {
-                        name: "policy".to_string(),
-                        message: "path contains non-UTF-8 characters".to_string(),
-                    }
-                });
+            let file_name = path.file_name().unwrap_or_default();
+            return Utf8PathBuf::from_path_buf(canon.join(file_name)).map_err(|_| {
+                LimError::tool_execution_msg("policy", "path contains non-UTF-8 characters")
+            });
         }
         let canon = std::fs::canonicalize(std_path).map_err(|e| {
-            LimError::ToolExecution {
-                name: "policy".to_string(),
-                message: format!("cannot resolve path: {e}"),
-            }
+            LimError::tool_execution("policy", format!("cannot resolve path: {e}"), e)
         })?;
-        Utf8PathBuf::from_path_buf(canon).map_err(|_| LimError::ToolExecution {
-            name: "policy".to_string(),
-            message: "path contains non-UTF-8 characters".to_string(),
+        Utf8PathBuf::from_path_buf(canon).map_err(|_| {
+            LimError::tool_execution_msg("policy", "path contains non-UTF-8 characters")
         })
     }
 
@@ -130,17 +119,18 @@ impl DefaultPolicy {
                         } else {
                             path.to_owned()
                         };
-                        let allowed = self.workspace_roots.iter().any(|root| {
-                            resolved.as_str().starts_with(root.as_str())
-                        });
+                        let allowed = self
+                            .workspace_roots
+                            .iter()
+                            .any(|root| resolved.as_str().starts_with(root.as_str()));
                         if !allowed {
-                            return Err(LimError::ToolExecution {
-                                name: "policy".to_string(),
-                                message: format!(
+                            return Err(LimError::tool_execution_msg(
+                                "policy",
+                                format!(
                                     "git -C points outside workspace roots: `{path_str}` not under {:?}",
                                     self.workspace_roots
                                 ),
-                            });
+                            ));
                         }
                         j += 2;
                     } else if tokens[j].starts_with("-") && tokens[j] != "-C" {
@@ -212,20 +202,19 @@ impl PermissionPolicy for DefaultPolicy {
 
         let canonical = Self::canonicalize(path)?;
 
-        let allowed = self.workspace_roots.iter().any(|root| {
-            canonical.as_str().starts_with(root.as_str())
-        });
+        let allowed =
+            self.workspace_roots.iter().any(|root| canonical.as_str().starts_with(root.as_str()));
 
         if allowed {
             Ok(())
         } else {
-            Err(LimError::ToolExecution {
-                name: "policy".to_string(),
-                message: format!(
+            Err(LimError::tool_execution_msg(
+                "policy",
+                format!(
                     "path `{canonical}` is outside allowed workspace roots: {:?}",
                     self.workspace_roots
                 ),
-            })
+            ))
         }
     }
 
@@ -240,10 +229,10 @@ impl PermissionPolicy for DefaultPolicy {
         // Blocklist substring match
         for pattern in &self.dangerous_commands {
             if full_cmd.contains(pattern) {
-                return Err(LimError::ToolExecution {
-                    name: "policy".to_string(),
-                    message: format!("command blocked by policy: matches `{pattern}`"),
-                });
+                return Err(LimError::tool_execution_msg(
+                    "policy",
+                    format!("command blocked by policy: matches `{pattern}`"),
+                ));
             }
         }
 
@@ -298,7 +287,12 @@ mod tests {
         let policy = DefaultPolicy::new(vec![]);
         let result = policy.check_command(
             "git",
-            &["config".to_string(), "--global".to_string(), "user.name".to_string(), "x".to_string()],
+            &[
+                "config".to_string(),
+                "--global".to_string(),
+                "user.name".to_string(),
+                "x".to_string(),
+            ],
         );
         assert!(result.is_err());
     }
@@ -321,10 +315,8 @@ mod tests {
         let root = Utf8PathBuf::try_from(canon.clone()).unwrap();
         let policy = DefaultPolicy::new(vec![root]);
         let git_path = canon.to_str().unwrap().to_string();
-        let result = policy.check_command(
-            "git",
-            &["-C".to_string(), git_path, "status".to_string()],
-        );
+        let result =
+            policy.check_command("git", &["-C".to_string(), git_path, "status".to_string()]);
         assert!(result.is_ok());
     }
 
@@ -332,10 +324,8 @@ mod tests {
     fn git_c_outside_workspace_blocked() {
         // Use a workspace root that's definitely not /tmp or /private/tmp
         let policy = DefaultPolicy::new(vec![Utf8PathBuf::from(".")]);
-        let result = policy.check_command(
-            "git",
-            &["-C".to_string(), "/tmp".to_string(), "status".to_string()],
-        );
+        let result = policy
+            .check_command("git", &["-C".to_string(), "/tmp".to_string(), "status".to_string()]);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, LimError::ToolExecution { .. }));

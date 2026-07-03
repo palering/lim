@@ -60,10 +60,7 @@ impl TuiEvent {
 
 /// Spawn the input poller task. Reads crossterm events and sends `TuiEvent`s
 /// to the provided channel. Also emits periodic `Tick` events for rendering.
-pub fn spawn_input_poller(
-    tx: mpsc::UnboundedSender<TuiEvent>,
-    cancel: CancellationToken,
-) {
+pub fn spawn_input_poller(tx: mpsc::UnboundedSender<TuiEvent>, cancel: CancellationToken) {
     tokio::spawn(async move {
         let mut events = EventStream::new();
         // Tick interval: ~60fps (16ms). Use 50ms to reduce CPU on idle.

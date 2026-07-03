@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
@@ -8,20 +9,27 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use lim_agent::agent_loop::{AgentConfig, AgentLoop};
+use lim_agent::context_window::{ContextConfig, ContextWindowManager};
 use lim_agent::registry::ToolRegistry;
+use lim_agent::{
+    AgentFactory, AgentRoleSpec, AlwaysPassVerifier, Budget, CommandVerifier, DaemonCommand,
+    DaemonLedger, DaemonServer, GoalResult, GoalStatus, IpcTransport, LedgerBackend, LlmVerifier,
+    LoopRunner, ReviewerVerifier, StateLedger, Verifier,
+};
 use lim_core::content::ContentBlock;
 use lim_core::context_edit::ContextEdit;
-use lim_core::error::Result;
+use lim_core::env::PlatformInfo;
 use lim_core::event::{AgentEvent, EventEnvelope};
+use lim_core::id::GoalId;
+use lim_core::inject::InjectInfo;
 use lim_core::message::AgentMessage;
 use lim_executor::local::LocalExecutor;
-use lim_llm::mock::{MockProvider, MockResponse, MockToolCall};
-use lim_llm::providers::{
-    create_provider, LimConfig, ProviderType,
-};
 use lim_llm::Provider;
+use lim_llm::mock::{MockProvider, MockResponse, MockToolCall};
+use lim_llm::providers::{LimConfig, ProviderType, create_provider};
 use lim_session::replay::replay_transcript;
 use lim_session::writer::SessionWriter;
+use lim_session::{SessionDetails, SessionManager, SessionMeta};
 
 /// Lim — a Rust-native agent runtime.
 #[derive(Parser)]
@@ -61,7 +69,12 @@ enum Commands {
         #[arg(long)]
         output: Option<Utf8PathBuf>,
 
-        /// Resume from a prior session JSONL file.
+        /// Resume from a prior session JSONL file or session ID.
+        ///
+        /// Accepts either:
+        /// - A path to a `.jsonl` file (e.g. `sessions/1234567890.jsonl`)
+        /// - A session ID (26-char ULID-style string) — the sessions
+        ///   directory is scanned for a matching file.
         ///
         /// When set, all messages from the prior session are loaded into
         /// context, and any `ContextEdited` events are replayed via
@@ -69,7 +82,7 @@ enum Commands {
         /// the next user turn. May be combined with `--fake` to script
         /// the new turn's assistant responses.
         #[arg(long)]
-        resume: Option<Utf8PathBuf>,
+        resume: Option<String>,
 
         /// Trust level: `workspace` (default, restricts file/command access
         /// to the project dir) or `permissive` (allows everything, dangerous).
@@ -101,6 +114,22 @@ enum Commands {
     /// List configured providers from `.lim/config.toml`.
     Providers,
 
+    /// List saved sessions in the local `sessions/` directory.
+    ///
+    /// Scans `sessions/*.jsonl` and prints a table sorted by last-modified
+    /// time (most recent first). Use `--details <PATH>` to see message count,
+    /// token totals, and the first user message (used as a title).
+    Sessions {
+        /// Show detailed metadata for the given session path (reads the
+        /// full JSONL to compute message count + token totals + title).
+        #[arg(long)]
+        details: Option<Utf8PathBuf>,
+
+        /// Limit the number of sessions listed (default: 20).
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
     /// Edit the context of a saved session (appends a `ContextEdited` event).
     ///
     /// Reads the session JSONL, applies the requested edits, and appends a
@@ -126,6 +155,201 @@ enum Commands {
         #[arg(long)]
         list: bool,
     },
+
+    /// Loop Engineering: run an agent across multiple sessions toward a goal.
+    ///
+    /// Each session gets a fresh context window. State is persisted in
+    /// `.lim/loop/<goal_id>/` so interrupted goals can be resumed.
+    ///
+    /// Examples:
+    ///   lim loop --goal "fix all clippy warnings" --verify "cargo clippy"
+    ///   lim loop --goal "write design doc" --verify llm --verifier-model claude-sonnet
+    ///   lim loop --resume 01J...
+    ///   lim loop --list
+    ///   lim loop --status 01J...
+    Loop {
+        /// Start a new goal with this description.
+        #[arg(long)]
+        goal: Option<String>,
+
+        /// Resume an interrupted goal by ID.
+        #[arg(long)]
+        resume: Option<String>,
+
+        /// List all goals in the workspace.
+        #[arg(long)]
+        list: bool,
+
+        /// Show status of a specific goal.
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Verifier mode. Three special values or a shell command:
+        ///
+        /// - A shell command (e.g. `"cargo clippy"`) — exit 0 = goal achieved
+        ///   (CommandVerifier, deterministic, preferred).
+        /// - `llm` — LLM-as-judge: a single LLM call with no tools, sees only
+        ///   a progress summary. Lightweight fallback for goals without
+        ///   deterministic verification.
+        /// - `reviewer` — spawns an independent reviewer agent with a fresh
+        ///   context window and tool access (can read files, run commands).
+        ///   The "second agent code review" pattern: deeper than `llm` but
+        ///   more expensive (full agent session per verify() call).
+        ///
+        /// If omitted, the loop runs one session and stops (AlwaysPass).
+        ///
+        /// For `llm` and `reviewer`, an independent evaluator provider/model
+        /// is used (avoids the main agent's reasoning bias). Configure with
+        /// `--verifier-provider`, `--verifier-model`, and optionally
+        /// `--verifier-instructions`.
+        #[arg(long)]
+        verify: Option<String>,
+
+        /// Maximum number of sessions to run.
+        #[arg(long)]
+        max_sessions: Option<usize>,
+
+        /// Maximum cumulative tokens across all sessions.
+        #[arg(long)]
+        max_tokens: Option<u64>,
+
+        /// Named provider instance from `.lim/config.toml`.
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Model name to request.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Provider instance for the LLM verifier (only used with
+        /// `--verify llm`). Defaults to the main `--provider`.
+        ///
+        /// Using a different provider for verification follows the
+        /// "independent evaluator" pattern — the verifier LLM should not
+        /// share the main agent's context or bias.
+        #[arg(long)]
+        verifier_provider: Option<String>,
+
+        /// Model for the LLM verifier (only used with `--verify llm`).
+        /// Defaults to the main `--model`.
+        ///
+        /// Tip: use a cheaper/faster model for verification (e.g.
+        /// `claude-haiku` or `gpt-4o-mini`) since each `verify()` call is
+        /// one LLM request.
+        #[arg(long)]
+        verifier_model: Option<String>,
+
+        /// Extra instructions for the LLM verifier (only used with
+        /// `--verify llm`). Free-form text appended to the verifier prompt.
+        ///
+        /// Example: `--verifier-instructions "be strict about edge cases"`
+        #[arg(long)]
+        verifier_instructions: Option<String>,
+
+        /// Trust level: `workspace` (default) or `permissive`.
+        #[arg(long, default_value = "workspace")]
+        trust: TrustArg,
+    },
+
+    /// Loop Engineering daemon: manage goals across multiple workspaces.
+    ///
+    /// The daemon mode (Stage 4 of the evolution roadmap) provides an
+    /// independent storage backend (`DaemonLedger`) for goals that may span
+    /// multiple workspaces. State is stored under `<storage-root>/` (default
+    /// `.lim/daemon/`) and can be synced back to a workspace's `.lim/loop/`
+    /// via `sync`.
+    ///
+    /// ## Current limitations (P3 scope)
+    ///
+    /// - `start` runs an in-process daemon (no socket/pipe IPC yet). Other
+    ///   subcommands operate directly on the daemon ledger storage.
+    /// - `submit` records the goal but does not yet spawn a `LoopRunner`.
+    ///   Actual execution requires `lim loop --resume <ID>` in the bound
+    ///   workspace after `sync`.
+    ///
+    /// ## Examples
+    ///
+    ///   lim loop-daemon start
+    ///   lim loop-daemon submit --goal "refactor module X" --workspace /path/to/ws
+    ///   lim loop-daemon list
+    ///   lim loop-daemon status 01J...
+    ///   lim loop-daemon sync 01J...
+    LoopDaemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+/// Subcommands for `lim loop-daemon`.
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon server (in-process, blocks until shutdown).
+    Start {
+        /// Storage root for the daemon ledger (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Submit a new goal to the daemon ledger.
+    Submit {
+        /// Goal description.
+        #[arg(long)]
+        goal: String,
+        /// Optional workspace path to bind the goal to.
+        #[arg(long)]
+        workspace: Option<Utf8PathBuf>,
+        /// Optional verifier command (recorded for future execution).
+        #[arg(long)]
+        verify: Option<String>,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// List all goals in the daemon ledger.
+    List {
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Show status of a goal in the daemon ledger.
+    Status {
+        /// Goal ID.
+        goal_id: String,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Pause a goal (sets status to Paused in the ledger).
+    Pause {
+        /// Goal ID.
+        goal_id: String,
+        /// Optional pause reason.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Resume a paused goal (sets status back to Running).
+    Resume {
+        /// Goal ID.
+        goal_id: String,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Sync a goal's state to its bound workspace's `.lim/loop/`.
+    Sync {
+        /// Goal ID.
+        goal_id: String,
+        /// Workspace root to sync to (overrides the bound workspace).
+        #[arg(long)]
+        workspace: Option<Utf8PathBuf>,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Shut down a running daemon (in-process; for future IPC mode).
+    Shutdown,
 }
 
 /// Fixture format for MockProvider scripted responses.
@@ -135,10 +359,7 @@ enum FixtureEntry {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_calls")]
-    ToolCalls {
-        text: Option<String>,
-        calls: Vec<FixtureToolCall>,
-    },
+    ToolCalls { text: Option<String>, calls: Vec<FixtureToolCall> },
 }
 
 /// CLI trust level argument.
@@ -160,43 +381,54 @@ impl TrustArg {
     }
 }
 
-/// Resolve workspace roots: git root if available, else current dir.
+/// Bundled CLI options for the loop verifier.
 ///
-/// See docs/draft/trust-and-approval.md "workspace_roots resolution".
-fn resolve_workspace_roots() -> Utf8PathBuf {
-    // Try git root first
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output();
-    if let Ok(out) = output
-        && out.status.success()
-    {
-        let s = String::from_utf8_lossy(&out.stdout);
-        let trimmed = s.trim();
-        if !trimmed.is_empty()
-            && let Ok(p) = Utf8PathBuf::from_path_buf(std::path::PathBuf::from(trimmed))
-        {
-            return p;
-        }
-    }
-    // Fallback to current dir
-    Utf8PathBuf::from(".")
+/// Groups `--verify` (mode selector) with the three LLM-verifier tuning
+/// flags so they can be threaded through `run_loop` / `build_loop_runner`
+/// as a single value instead of four loose arguments.
+#[derive(Clone, Default)]
+struct VerifierCliConfig {
+    /// Verifier mode: `Some("llm")` → LlmVerifier, `Some(cmd)` →
+    /// CommandVerifier, `None` → AlwaysPassVerifier (one-shot).
+    verify: Option<String>,
+    /// Provider instance for the LLM verifier (defaults to main `--provider`).
+    verifier_provider: Option<String>,
+    /// Model for the LLM verifier (defaults to main `--model`).
+    verifier_model: Option<String>,
+    /// Extra prompt instructions appended to the verifier prompt.
+    verifier_instructions: Option<String>,
 }
 
-/// Build a `LocalExecutor` based on the trust argument.
+/// Build a `LocalExecutor` based on the trust argument and detected platform.
 ///
-/// `workspace`: restrict to resolved workspace roots.
+/// `workspace`: restrict to detected workspace roots (git root preferred).
 /// `permissive`: allow everything, print a warning to stderr.
-fn build_executor(trust: TrustArg) -> Arc<LocalExecutor> {
+fn build_executor(trust: TrustArg, platform: &PlatformInfo) -> Arc<LocalExecutor> {
     if trust.is_permissive() {
         eprintln!("⚠ WARNING: running in permissive trust mode — no file/command restrictions.");
         eprintln!("  Use `--trust workspace` (default) for production.");
         #[allow(deprecated)]
         Arc::new(LocalExecutor::permissive())
     } else {
-        let root = resolve_workspace_roots();
-        eprintln!("Trust: workspace (root: {root})");
-        Arc::new(LocalExecutor::workspace(vec![root]))
+        let roots: Vec<Utf8PathBuf> = platform.workspace_roots.clone();
+        let root_display = roots.first().map(|r| r.as_str()).unwrap_or(".");
+        eprintln!("Trust: workspace (root: {root_display})");
+        Arc::new(LocalExecutor::workspace(roots))
+    }
+}
+
+/// Print detected platform info to stderr (gives the user visibility into
+/// shell selection, workspace root resolution, etc.).
+fn print_platform_info(platform: &PlatformInfo) {
+    eprintln!(
+        "Platform: {} / {} | Shell: {} ({})",
+        platform.os.as_str(),
+        platform.arch.as_str(),
+        platform.shell.as_str(),
+        platform.shell.description(),
+    );
+    if let Some(root) = platform.workspace_roots.first() {
+        eprintln!("Workspace: {root}");
     }
 }
 
@@ -206,19 +438,21 @@ struct FixtureToolCall {
     arguments: serde_json::Value,
 }
 
-fn load_fixture(path: &Utf8PathBuf) -> Result<Vec<MockResponse>> {
+fn load_fixture(path: &Utf8PathBuf) -> anyhow::Result<Vec<MockResponse>> {
     let content = std::fs::read_to_string(path.as_std_path()).map_err(|e| {
-        lim_core::error::LimError::ToolExecution {
-            name: "fixture_loader".to_string(),
-            message: format!("failed to read fixture `{path}`: {e}"),
-        }
+        lim_core::error::LimError::tool_execution(
+            "fixture_loader",
+            format!("failed to read fixture `{path}`: {e}"),
+            e,
+        )
     })?;
 
     let entries: Vec<FixtureEntry> = serde_json::from_str(&content).map_err(|e| {
-        lim_core::error::LimError::ToolExecution {
-            name: "fixture_loader".to_string(),
-            message: format!("failed to parse fixture `{path}`: {e}"),
-        }
+        lim_core::error::LimError::tool_execution(
+            "fixture_loader",
+            format!("failed to parse fixture `{path}`: {e}"),
+            e,
+        )
     })?;
 
     let responses: Vec<MockResponse> = entries
@@ -227,10 +461,7 @@ fn load_fixture(path: &Utf8PathBuf) -> Result<Vec<MockResponse>> {
             FixtureEntry::Text { text } => MockResponse::Text(text),
             FixtureEntry::ToolCalls { text, calls } => MockResponse::ToolCalls {
                 text,
-                calls: calls
-                    .into_iter()
-                    .map(|c| MockToolCall::new(c.name, c.arguments))
-                    .collect(),
+                calls: calls.into_iter().map(|c| MockToolCall::new(c.name, c.arguments)).collect(),
             },
         })
         .collect();
@@ -251,34 +482,62 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run {
-            provider,
-            model,
-            fake,
-            message,
-            output,
-            resume,
-            trust,
-        } => {
+        Commands::Run { provider, model, fake, message, output, resume, trust } => {
             run_session(provider, model, fake, resume, message, output, trust).await?;
         }
-        Commands::Tui {
-            provider,
-            model,
-            trust,
-        } => {
+        Commands::Tui { provider, model, trust } => {
             run_tui(provider, model, trust).await?;
         }
         Commands::Providers => {
             list_providers();
         }
-        Commands::EditContext {
-            session,
-            exclude,
-            replace,
-            list,
-        } => {
+        Commands::Sessions { details, limit } => {
+            if let Some(path) = details {
+                show_session_details(&path).await?;
+            } else {
+                list_sessions(limit).await?;
+            }
+        }
+        Commands::EditContext { session, exclude, replace, list } => {
             edit_context(session, exclude, replace, list).await?;
+        }
+        Commands::Loop {
+            goal,
+            resume,
+            list,
+            status,
+            verify,
+            max_sessions,
+            max_tokens,
+            provider,
+            model,
+            verifier_provider,
+            verifier_model,
+            verifier_instructions,
+            trust,
+        } => {
+            let verifier_cfg = VerifierCliConfig {
+                verify,
+                verifier_provider,
+                verifier_model,
+                verifier_instructions,
+            };
+            run_loop(
+                goal,
+                resume,
+                list,
+                status,
+                verifier_cfg,
+                max_sessions,
+                max_tokens,
+                provider,
+                model,
+                trust,
+            )
+            .await?;
+        }
+        Commands::LoopDaemon { action } => {
+            run_loop_daemon(action).await?;
         }
     }
 
@@ -307,10 +566,7 @@ fn list_providers() {
     for (name, instance) in &config.providers {
         let type_str = type_short(&instance.r#type);
         // Show full_url if set (bypasses base_url + suffix), else base_url.
-        let endpoint = instance
-            .full_url
-            .as_deref()
-            .unwrap_or_else(|| instance.resolve_base_url());
+        let endpoint = instance.full_url.as_deref().unwrap_or_else(|| instance.resolve_base_url());
         // Truncate long endpoints for display
         let endpoint_display: String = if endpoint.len() > 46 {
             format!("{}...", &endpoint[..43])
@@ -318,19 +574,9 @@ fn list_providers() {
             endpoint.to_string()
         };
         let model = instance.default_model.as_deref().unwrap_or("(none)");
-        let marker = if Some(name.as_str()) == config.default_provider.as_deref() {
-            " *"
-        } else {
-            ""
-        };
-        println!(
-            "{:<20} {:<18} {:<48} {}{}",
-            name,
-            type_str,
-            endpoint_display,
-            model,
-            marker,
-        );
+        let marker =
+            if Some(name.as_str()) == config.default_provider.as_deref() { " *" } else { "" };
+        println!("{:<20} {:<18} {:<48} {}{}", name, type_str, endpoint_display, model, marker,);
     }
 }
 
@@ -343,25 +589,167 @@ fn type_short(t: &ProviderType) -> &'static str {
     }
 }
 
+/// Resolve a `--resume <value>` argument into a JSONL file path.
+///
+/// Heuristics:
+/// - If `value` ends with `.jsonl` AND the file exists → use as-is (path).
+/// - Otherwise, treat as a session ID and scan `sessions/` for a match.
+/// - If neither matches, fall back to assuming it's a path (let the
+///   subsequent read fail with a clear error).
+async fn resolve_resume_path(value: &str) -> anyhow::Result<Utf8PathBuf> {
+    // Quick path case: looks like a path with `.jsonl` suffix.
+    if value.ends_with(".jsonl") {
+        let path = Utf8PathBuf::from(value);
+        if path.exists() {
+            return Ok(path);
+        }
+        // Path-like but doesn't exist — let the caller fail with a clearer error.
+        return Ok(path);
+    }
+
+    // Try parsing as a SessionId and look it up in sessions/.
+    if let Ok(session_id) = value.parse::<lim_core::id::SessionId>() {
+        let sm = SessionManager::new(Utf8PathBuf::from("sessions"));
+        if let Some(meta) = sm.find(&session_id).await? {
+            return Ok(meta.path);
+        }
+    }
+
+    // Fall back: treat as a path (relative or absolute). The subsequent
+    // read_all will produce a clear error if it doesn't exist.
+    Ok(Utf8PathBuf::from(value))
+}
+
+/// `lim sessions` — list saved sessions.
+async fn list_sessions(limit: usize) -> anyhow::Result<()> {
+    let sm = SessionManager::new(Utf8PathBuf::from("sessions"));
+    let sessions = sm.list().await?;
+
+    if sessions.is_empty() {
+        println!("No sessions found in `{}`.", sm.sessions_dir());
+        println!("Run `lim run --message '...'` to create a session.");
+        return Ok(());
+    }
+
+    let shown: Vec<&SessionMeta> = sessions.iter().take(limit).collect();
+    println!("Found {} session(s) (showing {}):", sessions.len(), shown.len());
+    println!();
+    println!("{:<26} {:<22} {:>7} {:>10}  PATH", "SESSION_ID", "UPDATED", "EVENTS", "SIZE");
+    for meta in &shown {
+        let updated = format_system_time(meta.updated_at);
+        let size_str = format_size(meta.size_bytes);
+        println!(
+            "{:<26} {:<22} {:>7} {:>10}  {}",
+            meta.session_id, updated, meta.event_count, size_str, meta.path
+        );
+    }
+
+    if sessions.len() > shown.len() {
+        println!();
+        println!("(Use `--limit {}` to show more)", sessions.len());
+    }
+    println!();
+    println!("Resume a session with:  lim run --resume <SESSION_ID>");
+    println!("View details with:     lim sessions --details <PATH>");
+    Ok(())
+}
+
+/// `lim sessions --details <path>` — show detailed session metadata.
+async fn show_session_details(path: &Utf8PathBuf) -> anyhow::Result<()> {
+    let sm = SessionManager::new(Utf8PathBuf::from("sessions"));
+    let details: SessionDetails = sm.details(path).await?;
+
+    println!("Session: {}", details.meta.session_id);
+    println!("Path:    {}", details.meta.path);
+    println!("Created: {}", format_system_time(details.meta.created_at));
+    println!("Updated: {}", format_system_time(details.meta.updated_at));
+    println!("Size:    {}", format_size(details.meta.size_bytes));
+    println!();
+    println!("Title:         {}", details.title);
+    println!("Messages:      {}", details.message_count);
+    println!("Events:        {}", details.meta.event_count);
+    println!("Input tokens:  {}", details.total_input_tokens);
+    println!("Output tokens: {}", details.total_output_tokens);
+    println!();
+    println!("Resume with: lim run --resume {}", details.meta.session_id);
+    Ok(())
+}
+
+/// Format a SystemTime as a human-readable timestamp (UTC).
+fn format_system_time(t: SystemTime) -> String {
+    let secs = t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (y, mo, d, h, mi, s) = unix_to_ymd_hms(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+}
+
+/// Convert Unix seconds to (year, month, day, hour, minute, second).
+///
+/// Uses the proleptic Gregorian calendar. No leap seconds. Good enough for
+/// display purposes; we avoid pulling in chrono for this one helper.
+fn unix_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let secs_in_day = (secs % 86400) as u32;
+    let h = secs_in_day / 3600;
+    let mi = (secs_in_day % 3600) / 60;
+    let s = secs_in_day % 60;
+
+    // Days since 1970-01-01 → (year, month, day).
+    // Algorithm: Howard Hinnant's "days_from_civil" inverse.
+    let z = days + 719468; // shift epoch to 0000-03-01
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (doy * 5 + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u32, m, d, h, mi, s)
+}
+
+/// Format a byte count as a human-readable string (e.g. "1.2 KB", "3.4 MB").
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kb = bytes as f64 / 1024.0;
+    if kb < 1024.0 {
+        return format!("{:.1} KB", kb);
+    }
+    let mb = kb / 1024.0;
+    if mb < 1024.0 {
+        return format!("{:.1} MB", mb);
+    }
+    let gb = mb / 1024.0;
+    format!("{:.1} GB", gb)
+}
+
 async fn run_session(
     cli_provider: Option<String>,
     cli_model: Option<String>,
     fake: Option<Utf8PathBuf>,
-    resume: Option<Utf8PathBuf>,
+    resume: Option<String>,
     user_message: String,
     output_path: Option<Utf8PathBuf>,
     trust: TrustArg,
-) -> Result<()> {
+) -> anyhow::Result<()> {
+    // Resolve resume: accept either a path or a session ID.
+    let resume_path: Option<Utf8PathBuf> = match resume.as_ref() {
+        Some(s) => Some(resolve_resume_path(s).await?),
+        None => None,
+    };
+
     // If resuming, load prior session events and replay messages + edits.
     // prior_messages will be prepended to the new turn's context.
     // user_edits will be re-applied on every turn (persistent edits).
-    let (prior_messages, user_edits, resume_label) = match resume.as_ref() {
+    let (prior_messages, user_edits, resume_label) = match resume_path.as_ref() {
         Some(path) => {
             let events = lim_session::reader::SessionReader::read_all(path).await?;
             let messages = replay_transcript(&events);
             let edits = lim_session::replay::replay_edits(&events);
-            let label = format!("{} ({} prior messages, {} edits)",
-                path, messages.len(), edits.len());
+            let label =
+                format!("{} ({} prior messages, {} edits)", path, messages.len(), edits.len());
             (messages, edits, Some(label))
         }
         None => (Vec::new(), Vec::new(), None),
@@ -402,34 +790,43 @@ async fn run_session(
         println!("Resume:   {label}");
     }
 
+    // Detect platform (OS / arch / shell / workspace) — drives executor
+    // scoping and system-prompt injection. Done once at startup; the snapshot
+    // is immutable for the rest of the session.
+    let platform = PlatformInfo::detect();
+    print_platform_info(&platform);
+
     // Create executor and tool registry
-    let executor = build_executor(trust);
-    let mut registry = ToolRegistry::new();
-    lim_tools::register_builtins(&mut registry, executor);
-    let registry = Arc::new(registry);
+    let executor = build_executor(trust, &platform);
+    let registry = Arc::new(ToolRegistry::new());
+    lim_tools::register_builtins(&registry, executor)?;
 
     println!(
         "Registered {} tools: {}",
         registry.schemas().len(),
-        registry
-            .schemas()
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        registry.schemas().iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
     );
 
     // Set up event channel and cancellation
     let (event_tx, mut event_rx) = broadcast::channel(1000);
     let cancel = CancellationToken::new();
 
+    // Inject platform info into the system prompt so the LLM can adapt its
+    // syntax (POSIX vs PowerShell, Unix paths vs Windows paths, etc.).
+    let inject = InjectInfo::new(platform);
+    let system_prompt = inject.system_prompt_fragment();
+
     let config = AgentConfig {
         model: model_name,
+        system_prompt: Some(system_prompt),
         ..AgentConfig::default()
     };
     let mut agent = AgentLoop::new(provider, registry, event_tx.clone(), cancel)
         .with_config(config)
-        .with_user_edits(user_edits);
+        .with_user_edits(user_edits)
+        // Wire up auto-compact so long sessions stay within the model's
+        // context budget. Default config (128K window, 0.8 trigger ratio).
+        .with_context_window(ContextWindowManager::new(ContextConfig::default()));
 
     // Determine output path
     let session_path = output_path.unwrap_or_else(|| {
@@ -495,11 +892,7 @@ async fn run_session(
     println!("Messages from replay:   {}", replayed.len());
     println!("Event log: {session_path}");
 
-    assert_eq!(
-        replayed.len(),
-        messages.len(),
-        "replay produced different message count!"
-    );
+    assert_eq!(replayed.len(), messages.len(), "replay produced different message count!");
     println!("\nReplay verification: OK");
 
     Ok(())
@@ -518,9 +911,7 @@ fn print_transcript(messages: &[AgentMessage]) {
                         lim_core::content::ContentBlock::Text { text } => {
                             println!("{text}");
                         }
-                        lim_core::content::ContentBlock::ToolCall {
-                            name, arguments, ..
-                        } => {
+                        lim_core::content::ContentBlock::ToolCall { name, arguments, .. } => {
                             println!("[tool call: {name}({})]", arguments);
                         }
                         lim_core::content::ContentBlock::Thinking { text } => {
@@ -554,7 +945,7 @@ fn chrono_lite_timestamp() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
+        .expect("system clock is before UNIX_EPOCH");
     format!("{}", now.as_secs())
 }
 
@@ -563,7 +954,7 @@ async fn run_tui(
     cli_provider: Option<String>,
     cli_model: Option<String>,
     trust: TrustArg,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     // Resolve provider + model from config
     let config = LimConfig::load_from_default_path();
     let provider_name = config
@@ -577,14 +968,19 @@ async fn run_tui(
     let model = config
         .resolve_model(instance, cli_model.as_deref())
         .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
-    let provider = create_provider(instance)
-        .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+    let provider =
+        create_provider(instance).map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+
+    // Detect platform — drives executor scoping. (TUI does its own platform
+    // detection for system-prompt injection; here we only need it for the
+    // executor's workspace roots.)
+    let platform = PlatformInfo::detect();
+    print_platform_info(&platform);
 
     // Create executor and tool registry
-    let executor = build_executor(trust);
-    let mut registry = ToolRegistry::new();
-    lim_tools::register_builtins(&mut registry, executor);
-    let registry = Arc::new(registry);
+    let executor = build_executor(trust, &platform);
+    let registry = Arc::new(ToolRegistry::new());
+    lim_tools::register_builtins(&registry, executor)?;
 
     // Set up event channel and cancellation
     let (event_tx, _event_rx) = broadcast::channel(1000);
@@ -655,7 +1051,7 @@ async fn edit_context(
     exclude: Option<String>,
     replace: Vec<String>,
     list: bool,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let events = lim_session::reader::SessionReader::read_all(&session).await?;
     if events.is_empty() {
         eprintln!("Session file `{session}` is empty or does not exist");
@@ -686,11 +1082,8 @@ async fn edit_context(
                     _ => None,
                 })
                 .unwrap_or_default();
-            let preview = if preview.len() > 60 {
-                format!("{}...", &preview[..57])
-            } else {
-                preview
-            };
+            let preview =
+                if preview.len() > 60 { format!("{}...", &preview[..57]) } else { preview };
             println!("{i:<6} {role:<6} {preview}");
         }
     }
@@ -703,10 +1096,8 @@ async fn edit_context(
     let mut edit = ContextEdit::none();
 
     if let Some(exclude_str) = exclude {
-        let indices: Vec<usize> = exclude_str
-            .split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .collect();
+        let indices: Vec<usize> =
+            exclude_str.split(',').filter_map(|s| s.trim().parse::<usize>().ok()).collect();
         for idx in &indices {
             edit = edit.exclude(*idx);
         }
@@ -751,14 +1142,15 @@ async fn edit_context(
             messages.len()
         );
         eprintln!("Valid indices: 0..{}", messages.len().saturating_sub(1));
-        return Err(lim_core::error::LimError::ToolExecution {
-            name: "edit_context".to_string(),
-            message: "edit validation failed: out-of-bounds indices".to_string(),
-        });
+        return Err(lim_core::error::LimError::tool_execution_msg(
+            "edit_context",
+            "edit validation failed: out-of-bounds indices",
+        )
+        .into());
     }
 
     // Recover correlation IDs from the last event in the file.
-    let last = events.last().unwrap();
+    let last = events.last().expect("checked is_empty above");
     let next_seq = last.seq + 1;
     let session_id = last.session_id;
     let branch_id = last.branch_id;
@@ -773,10 +1165,11 @@ async fn edit_context(
     );
 
     let line = serde_json::to_string(&envelope).map_err(|e| {
-        lim_core::error::LimError::ToolExecution {
-            name: "edit_context".to_string(),
-            message: format!("failed to serialize event: {e}"),
-        }
+        lim_core::error::LimError::tool_execution(
+            "edit_context",
+            format!("failed to serialize event: {e}"),
+            e,
+        )
     })?;
 
     // Append to the session file. We intentionally do NOT use SessionWriter
@@ -788,18 +1181,734 @@ async fn edit_context(
         .append(true)
         .open(session.as_std_path())
         .await
-        .map_err(|e| lim_core::error::LimError::SessionIo(format!(
-            "failed to open session file for append: {e}"
-        )))?;
+        .map_err(|e| {
+            lim_core::error::LimError::session_io(
+                format!("failed to open session file for append: {e}"),
+                e,
+            )
+        })?;
     file.write_all((line + "\n").as_bytes()).await.map_err(|e| {
-        lim_core::error::LimError::SessionIo(format!("failed to append edit: {e}"))
+        lim_core::error::LimError::session_io(format!("failed to append edit: {e}"), e)
     })?;
     file.flush().await.map_err(|e| {
-        lim_core::error::LimError::SessionIo(format!("failed to flush edit: {e}"))
+        lim_core::error::LimError::session_io(format!("failed to flush edit: {e}"), e)
     })?;
 
     println!("\nAppended ContextEdited event (seq {next_seq}) to {session}");
     println!("Next `lim run --resume {session}` will apply this edit.");
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Loop Engineering (`lim loop`)
+// ---------------------------------------------------------------------------
+
+/// Dispatch for `lim loop` subcommand.
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
+    goal: Option<String>,
+    resume: Option<String>,
+    list: bool,
+    status: Option<String>,
+    verifier_cfg: VerifierCliConfig,
+    max_sessions: Option<usize>,
+    max_tokens: Option<u64>,
+    cli_provider: Option<String>,
+    cli_model: Option<String>,
+    trust: TrustArg,
+) -> anyhow::Result<()> {
+    if list {
+        return list_loop_goals().await;
+    }
+    if let Some(goal_id_str) = status {
+        return show_loop_goal_status(&goal_id_str).await;
+    }
+    if let Some(goal_text) = goal {
+        println!("Starting goal: {goal_text}");
+        print_verifier_summary(&verifier_cfg);
+        println!();
+        let runner = build_loop_runner(
+            verifier_cfg,
+            max_sessions,
+            max_tokens,
+            cli_provider,
+            cli_model,
+            trust,
+        )
+        .await?;
+        let (goal_id, result) = runner.start_goal(&goal_text).await?;
+        print_goal_result(&goal_id, result, runner.ledger()).await?;
+        return Ok(());
+    }
+    if let Some(goal_id_str) = resume {
+        let goal_id: GoalId = goal_id_str.parse().map_err(|e| {
+            lim_core::error::LimError::Config(format!("invalid goal ID `{goal_id_str}`: {e}"))
+        })?;
+        println!("Resuming goal: {goal_id}");
+        print_verifier_summary(&verifier_cfg);
+        println!();
+        let runner = build_loop_runner(
+            verifier_cfg,
+            max_sessions,
+            max_tokens,
+            cli_provider,
+            cli_model,
+            trust,
+        )
+        .await?;
+        let result = runner.resume_goal(&goal_id).await?;
+        print_goal_result(&goal_id, result, runner.ledger()).await?;
+        return Ok(());
+    }
+
+    eprintln!("Usage: lim loop --goal \"...\" | --resume <ID> | --list | --status <ID>");
+    eprintln!("Run `lim loop --help` for details.");
+    std::process::exit(1);
+}
+
+/// Print a one-line summary of the verifier configuration.
+fn print_verifier_summary(cfg: &VerifierCliConfig) {
+    match cfg.verify.as_deref() {
+        Some("llm") => {
+            let p = cfg.verifier_provider.as_deref().unwrap_or("(default)");
+            let m = cfg.verifier_model.as_deref().unwrap_or("(default)");
+            println!("Verifier: llm (provider={p}, model={m})");
+        }
+        Some("reviewer") => {
+            let p = cfg.verifier_provider.as_deref().unwrap_or("(default)");
+            let m = cfg.verifier_model.as_deref().unwrap_or("(default)");
+            println!("Verifier: reviewer (provider={p}, model={m})");
+        }
+        Some(cmd) => println!("Verifier: {cmd}"),
+        None => println!("Verifier: always-pass (one-shot)"),
+    }
+}
+
+/// Load the `reviewer` role config from `.lim/agents/reviewer.toml` (or
+/// global `~/.config/lim/agents/reviewer.toml` if `agents=hybrid`).
+///
+/// Returns an error if the config loader fails or the `reviewer` role is
+/// not found. The caller is expected to fall back to `default_reviewer_spec`
+/// on error (so non-"not found" errors are logged but not fatal).
+fn load_reviewer_role_config() -> anyhow::Result<lim_config::schema::AgentRoleConfig> {
+    use lim_config::{ConfigLoader, ProjectPaths, XdgPaths};
+
+    // Detect paths. If detection fails, we can't load role configs — fall
+    // back to default. This is non-fatal.
+    let xdg = XdgPaths::detect().map_err(|e| anyhow::anyhow!("XDG path detection failed: {e}"))?;
+    let project = ProjectPaths::detect()
+        .map_err(|e| anyhow::anyhow!("project path detection failed: {e}"))?;
+
+    let loader = ConfigLoader::new(xdg, project);
+    let loaded = loader.load().map_err(|e| anyhow::anyhow!("config load failed: {e}"))?;
+
+    loaded
+        .agent_roles
+        .get("reviewer")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("reviewer role config not found"))
+}
+
+/// Convert a config-layer `AgentRoleConfig` to a harness-layer `AgentRoleSpec`.
+///
+/// This is the boundary between `lim-config` (product/config layer) and
+/// `lim-agent` (harness layer): we strip the fields that have already been
+/// resolved by the caller (`role`, `provider`, `workspace_path`) and convert
+/// `tools_whitelist` from `Vec` to `Option<Vec>` (empty → None).
+fn role_config_to_spec(cfg: &lim_config::schema::AgentRoleConfig) -> AgentRoleSpec {
+    AgentRoleSpec {
+        system_prompt: cfg.system_prompt.clone(),
+        model: cfg.model.clone(),
+        tools_whitelist: if cfg.tools_whitelist.is_empty() {
+            None
+        } else {
+            Some(cfg.tools_whitelist.clone())
+        },
+        max_turns: cfg.max_turns,
+    }
+}
+
+/// The default reviewer spec used when no `.lim/agents/reviewer.toml` exists.
+///
+/// This preserves the pre-P4.5 behavior: a hard-coded reviewer system prompt
+/// with the model resolved from CLI flags / provider default.
+fn default_reviewer_spec(model: &str) -> AgentRoleSpec {
+    AgentRoleSpec {
+        system_prompt: Some(
+            "You are an independent code reviewer. Inspect the workspace and \
+             determine whether the stated goal has been achieved. You have \
+             tool access (read files, run commands). Be thorough but concise. \
+             Always end with a verdict on the first line: PASS, FAIL: <reason>, \
+             or NEEDS_HUMAN."
+                .to_string(),
+        ),
+        model: Some(model.to_string()),
+        tools_whitelist: None,
+        max_turns: None,
+    }
+}
+
+/// Build a `LoopRunner` from CLI args. Shared by `--goal` and `--resume`.
+async fn build_loop_runner(
+    verifier_cfg: VerifierCliConfig,
+    max_sessions: Option<usize>,
+    max_tokens: Option<u64>,
+    cli_provider: Option<String>,
+    cli_model: Option<String>,
+    trust: TrustArg,
+) -> anyhow::Result<LoopRunner> {
+    // Resolve provider + model from config
+    let config = LimConfig::load_from_default_path();
+    let provider_name = config
+        .resolve_provider_name(cli_provider.as_deref())
+        .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+    let instance = config.provider(provider_name).ok_or_else(|| {
+        lim_core::error::LimError::Config(format!(
+            "provider `{provider_name}` not found in .lim/config.toml"
+        ))
+    })?;
+    let model = config
+        .resolve_model(instance, cli_model.as_deref())
+        .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+    let provider =
+        create_provider(instance).map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+
+    println!("Provider: {provider_name}");
+    if !model.is_empty() {
+        println!("Model:    {model}");
+    }
+
+    // Platform + executor + tools
+    let platform = PlatformInfo::detect();
+    print_platform_info(&platform);
+    let executor = build_executor(trust, &platform);
+    let registry = Arc::new(ToolRegistry::new());
+    lim_tools::register_builtins(&registry, executor)?;
+
+    // StateLedger — cross-session state in .lim/loop/
+    // Built before the factory so we can register loop-control tools that
+    // share the ledger with the runner. The agent can call these tools to
+    // introspect the goal it is currently working on (AI-native introspection).
+    let project_root = Utf8PathBuf::from(".");
+    let ledger = StateLedger::new(project_root.clone());
+    // Register loop-control tools with a shared clone of the ledger.
+    lim_tools::register_loop_control_tools(&registry, Arc::new(ledger.clone()))?;
+    println!("Registered {} tools (incl. loop-control)", registry.schemas().len(),);
+
+    // AgentFactory — each session gets a fresh AgentLoop + context window.
+    // Clone the registry Arc so it remains available for the reviewer factory
+    // (when `--verify reviewer` is used).
+    let inject = InjectInfo::new(platform);
+    let agent_config = AgentConfig {
+        model,
+        system_prompt: Some(inject.system_prompt_fragment()),
+        ..AgentConfig::default()
+    };
+    let factory = AgentFactory::new(
+        provider,
+        registry.clone(),
+        agent_config,
+        Some(ContextConfig::default()),
+        project_root.join("sessions"),
+    );
+
+    // Verifier — four modes:
+    //   1. `--verify reviewer`          → ReviewerVerifier (independent reviewer agent)
+    //   2. `--verify llm`               → LlmVerifier (single LLM call, no tools)
+    //   3. `--verify "<command>"`       → CommandVerifier (deterministic, preferred)
+    //   4. (omitted)                    → AlwaysPassVerifier (one-shot)
+    //
+    // `reviewer` and `llm` both support an independent evaluator provider/model
+    // (configured via --verifier-provider / --verifier-model) to avoid the
+    // main agent's reasoning bias — the "independent evaluator" pattern from
+    // Claude Code's Loop Engineering. `reviewer` goes further: it spawns a
+    // full agent with tools and fresh context ("second agent code review").
+    let verifier: Box<dyn Verifier> = match verifier_cfg.verify.as_deref() {
+        Some("reviewer") => {
+            // Independent reviewer factory — fresh context, own provider/model,
+            // shares the tool registry so the reviewer can inspect the workspace.
+            //
+            // Role config resolution (P4.5):
+            //   1. Try to load `.lim/agents/reviewer.toml` (or global) via ConfigLoader.
+            //   2. If found, use `ReviewerVerifier::from_role_spec` — this lets users
+            //      customize the reviewer's system_prompt / model / tools_whitelist
+            //      declaratively without touching CLI flags.
+            //   3. If not found, fall back to the hard-coded default reviewer config
+            //      (backward compat — same behavior as before P4.5).
+            //
+            // CLI flags `--verifier-provider` / `--verifier-model` always override
+            // the role config's provider/model (they are explicit user intent).
+            let v_provider_name = config
+                .resolve_provider_name(verifier_cfg.verifier_provider.as_deref())
+                .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+            let v_instance = config.provider(v_provider_name).ok_or_else(|| {
+                lim_core::error::LimError::Config(format!(
+                    "verifier provider `{v_provider_name}` not found in .lim/config.toml"
+                ))
+            })?;
+            let v_model = config
+                .resolve_model(v_instance, verifier_cfg.verifier_model.as_deref())
+                .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+            let v_provider = create_provider(v_instance)
+                .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+
+            println!("Reviewer provider: {v_provider_name}");
+            if !v_model.is_empty() {
+                println!("Reviewer model:    {v_model}");
+            }
+
+            // Try to load reviewer role config from `.lim/agents/reviewer.toml`
+            // (or global `~/.config/lim/agents/reviewer.toml` if agents=hybrid).
+            // If found, role config provides system_prompt / tools_whitelist /
+            // max_turns. Model priority: CLI flag > role config > provider default.
+            let role_spec = match load_reviewer_role_config() {
+                Ok(role_cfg) => {
+                    let model = if verifier_cfg.verifier_model.is_none() {
+                        role_cfg.model.clone().unwrap_or_else(|| v_model.clone())
+                    } else {
+                        v_model.clone()
+                    };
+                    let spec = role_config_to_spec(&role_cfg);
+                    AgentRoleSpec { model: Some(model), ..spec }
+                }
+                Err(e) => {
+                    if !e.to_string().contains("not found") {
+                        eprintln!("warning: failed to load reviewer role config: {e}");
+                    }
+                    default_reviewer_spec(&v_model)
+                }
+            };
+
+            Box::new(ReviewerVerifier::from_role_spec(
+                role_spec,
+                v_provider,
+                registry,
+                Some(ContextConfig::default()),
+                project_root.join("sessions"),
+                verifier_cfg.verifier_instructions,
+            ))
+        }
+        Some("llm") => {
+            let v_provider_name = config
+                .resolve_provider_name(verifier_cfg.verifier_provider.as_deref())
+                .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+            let v_instance = config.provider(v_provider_name).ok_or_else(|| {
+                lim_core::error::LimError::Config(format!(
+                    "verifier provider `{v_provider_name}` not found in .lim/config.toml"
+                ))
+            })?;
+            let v_model = config
+                .resolve_model(v_instance, verifier_cfg.verifier_model.as_deref())
+                .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+            let v_provider = create_provider(v_instance)
+                .map_err(|e| lim_core::error::LimError::Config(e.to_string()))?;
+
+            println!("Verifier provider: {v_provider_name}");
+            if !v_model.is_empty() {
+                println!("Verifier model:    {v_model}");
+            }
+
+            Box::new(LlmVerifier::new(v_provider, v_model, verifier_cfg.verifier_instructions))
+        }
+        Some(cmd) => Box::new(CommandVerifier::new(cmd)),
+        None => Box::new(AlwaysPassVerifier),
+    };
+
+    // Budget — None means unlimited
+    let budget = Budget { max_sessions, max_total_tokens: max_tokens };
+
+    // loop_dir enables LoopEvent persistence (`.lim/loop/<goal_id>/events.jsonl`)
+    // and ReviewerVerifier event persistence (`.lim/loop/<goal_id>/reviews/`).
+    let loop_dir = project_root.join(".lim").join("loop");
+    Ok(LoopRunner::new(factory, ledger, verifier, budget).with_loop_dir(loop_dir))
+}
+
+/// Print the final result of a Goal Loop run.
+async fn print_goal_result(
+    goal_id: &GoalId,
+    result: GoalResult,
+    ledger: &dyn LedgerBackend,
+) -> anyhow::Result<()> {
+    println!("\n--- Goal Loop Result ---");
+    println!("Goal ID: {goal_id}");
+    match result {
+        GoalResult::Success => println!("Status: SUCCESS"),
+        GoalResult::BudgetExhausted => println!("Status: BUDGET EXHAUSTED"),
+        GoalResult::NeedsHuman(reason) => println!("Status: NEEDS HUMAN — {reason}"),
+        GoalResult::Failed(reason) => println!("Status: FAILED — {reason}"),
+        GoalResult::Cancelled => println!("Status: CANCELLED"),
+    }
+
+    // Show final state
+    let state = ledger.load(goal_id).await?;
+    println!("Sessions run: {}", state.session_count);
+    println!("Total tokens: {}", state.total_tokens);
+    println!("State file:   .lim/loop/{goal_id}/state.json");
+    println!();
+    println!("Resume with:  lim loop --resume {goal_id}");
+    println!("Status with:  lim loop --status {goal_id}");
+
+    Ok(())
+}
+
+/// `lim loop --list` — list all goals in the workspace.
+async fn list_loop_goals() -> anyhow::Result<()> {
+    let ledger = StateLedger::new(Utf8PathBuf::from("."));
+    let goals = ledger.list_goals().await?;
+
+    if goals.is_empty() {
+        println!("No goals found in .lim/loop/");
+        println!("Start one with: lim loop --goal \"...\" --verify \"cargo test\"");
+        return Ok(());
+    }
+
+    println!("Found {} goal(s):", goals.len());
+    println!();
+    println!("{:<26} {:<12} {:>8} {:>12}  GOAL", "GOAL_ID", "STATUS", "SESSIONS", "TOKENS");
+    for (goal_id, state) in &goals {
+        let status = format_goal_status_short(&state.status);
+        let goal_preview = if state.goal.len() > 50 {
+            format!("{}...", &state.goal[..47])
+        } else {
+            state.goal.clone()
+        };
+        println!(
+            "{goal_id:<26} {status:<12} {:>8} {:>12}  {goal_preview}",
+            state.session_count, state.total_tokens,
+        );
+    }
+    println!();
+    println!("Resume with:  lim loop --resume <GOAL_ID>");
+    println!("Details with: lim loop --status <GOAL_ID>");
+    Ok(())
+}
+
+/// `lim loop --status <ID>` — show detailed status of one goal.
+async fn show_loop_goal_status(goal_id_str: &str) -> anyhow::Result<()> {
+    let goal_id: GoalId = goal_id_str.parse().map_err(|e| {
+        lim_core::error::LimError::Config(format!("invalid goal ID `{goal_id_str}`: {e}"))
+    })?;
+    let ledger = StateLedger::new(Utf8PathBuf::from("."));
+    let state = ledger.load(&goal_id).await?;
+
+    println!("Goal ID:      {goal_id}");
+    println!("Goal:         {}", state.goal);
+    println!("Status:       {}", format_goal_status(&state.status));
+    println!("Sessions:     {}", state.session_count);
+    println!("Turns:        {}", state.turn_count);
+    println!("Tokens:       {}", state.total_tokens);
+    println!("Created:      {}", format_unix_seconds(state.created_at));
+    println!("Updated:      {}", format_unix_seconds(state.updated_at));
+    if let Some(sid) = state.last_session_id {
+        println!("Last session: {sid}");
+    }
+    println!();
+    println!("State file: .lim/loop/{goal_id}/state.json");
+    println!("Goal file:  .lim/loop/{goal_id}/goal.md");
+    if !state.progress.is_empty() {
+        println!();
+        println!("--- Progress ---");
+        println!("{}", state.progress);
+    }
+    Ok(())
+}
+
+/// Format `GoalStatus` for display in `--status`.
+fn format_goal_status(status: &GoalStatus) -> String {
+    match status {
+        GoalStatus::Running => "running".to_string(),
+        GoalStatus::Paused => "paused".to_string(),
+        GoalStatus::Success => "success".to_string(),
+        GoalStatus::Failed(reason) => format!("failed: {reason}"),
+        GoalStatus::NeedsHuman(reason) => format!("needs_human: {reason}"),
+    }
+}
+
+/// Format `GoalStatus` for the table in `--list` (short, no reason text).
+fn format_goal_status_short(status: &GoalStatus) -> &'static str {
+    match status {
+        GoalStatus::Running => "running",
+        GoalStatus::Paused => "paused",
+        GoalStatus::Success => "success",
+        GoalStatus::Failed(_) => "failed",
+        GoalStatus::NeedsHuman(_) => "needs_human",
+    }
+}
+
+/// Format a Unix timestamp (seconds) as a human-readable UTC string.
+fn format_unix_seconds(secs: u64) -> String {
+    let (y, mo, d, h, mi, s) = unix_to_ymd_hms(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+}
+
+// ---------------------------------------------------------------------------
+// Loop Engineering daemon (`lim loop-daemon ...`)
+// ---------------------------------------------------------------------------
+
+/// Default storage root for the daemon ledger (relative to CWD).
+const DEFAULT_DAEMON_STORAGE: &str = ".lim/daemon";
+
+/// Resolve a storage root from CLI arg or default.
+fn resolve_storage_root(arg: Option<Utf8PathBuf>) -> Utf8PathBuf {
+    arg.unwrap_or_else(|| Utf8PathBuf::from(DEFAULT_DAEMON_STORAGE))
+}
+
+/// Dispatch a `lim loop-daemon <action>` subcommand.
+async fn run_loop_daemon(action: DaemonAction) -> anyhow::Result<()> {
+    match action {
+        DaemonAction::Start { storage } => run_daemon_start(storage).await,
+        DaemonAction::Submit { goal, workspace, verify, storage } => {
+            run_daemon_submit(goal, workspace, verify, storage).await
+        }
+        DaemonAction::List { storage } => run_daemon_list(storage).await,
+        DaemonAction::Status { goal_id, storage } => run_daemon_status(goal_id, storage).await,
+        DaemonAction::Pause { goal_id, reason, storage } => {
+            run_daemon_pause(goal_id, reason, storage).await
+        }
+        DaemonAction::Resume { goal_id, storage } => run_daemon_resume(goal_id, storage).await,
+        DaemonAction::Sync { goal_id, workspace, storage } => {
+            run_daemon_sync(goal_id, workspace, storage).await
+        }
+        DaemonAction::Shutdown => {
+            eprintln!("shutdown: not supported in the current in-process daemon mode");
+            eprintln!(
+                "(In a future IPC mode, this command will send a Shutdown command to the running daemon.)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `lim loop-daemon start` — start the in-process daemon server.
+///
+/// Spawns the `DaemonServer` as a background task and prints a "running"
+/// message. The server processes commands until a `Shutdown` is received or
+/// the task is killed. Since there's no IPC transport yet, this is mainly
+/// useful for integration tests; CLI clients should use the other subcommands
+/// directly (they operate on the same storage).
+async fn run_daemon_start(storage: Option<Utf8PathBuf>) -> anyhow::Result<()> {
+    let storage_root = resolve_storage_root(storage);
+    let ledger = DaemonLedger::new(storage_root.clone());
+    let (server, handle) = DaemonServer::new(ledger);
+
+    println!("Starting daemon server (in-process)");
+    println!("  Storage: {storage_root}");
+    println!(
+        "  Status:  ready (no IPC transport — other `loop-daemon` subcommands operate directly on storage)"
+    );
+    println!();
+    println!("Press Ctrl+C to shut down.");
+
+    // Spawn the server task.
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    // Wait for Ctrl+C.
+    tokio::signal::ctrl_c().await?;
+
+    // Send shutdown command (best-effort).
+    let _ = handle.send(DaemonCommand::Shutdown).await;
+
+    // Wait for the server task to finish.
+    let _ = server_task.await;
+    println!("\nDaemon server shut down.");
+    Ok(())
+}
+
+/// `lim loop-daemon submit --goal "..." [--workspace ...] [--verify ...]`
+async fn run_daemon_submit(
+    goal: String,
+    workspace: Option<Utf8PathBuf>,
+    verify: Option<String>,
+    storage: Option<Utf8PathBuf>,
+) -> anyhow::Result<()> {
+    let storage_root = resolve_storage_root(storage);
+    let ledger = DaemonLedger::new(storage_root.clone());
+
+    let goal_id = ledger.create_goal(&goal).await?;
+
+    println!("Submitted goal to daemon ledger:");
+    println!("  Goal ID:  {goal_id}");
+    println!("  Storage:  {storage_root}");
+    println!("  Goal:     {goal}");
+    if let Some(ws) = &workspace {
+        ledger.bind_workspace(&goal_id, ws.clone(), true).await?;
+        println!("  Workspace: {ws}");
+    }
+    if let Some(verify) = &verify {
+        // NOTE: verifier_cmd is recorded but not yet executed by the daemon.
+        // Future P4 work will integrate AgentFactory + LoopRunner into the daemon.
+        println!(
+            "  Verifier: {verify} (recorded; run `lim loop --resume {goal_id}` in the workspace to execute)"
+        );
+    }
+    println!();
+    println!("Next steps:");
+    if workspace.is_some() {
+        println!("  lim loop-daemon sync {goal_id}");
+        println!("  cd <workspace> && lim loop --resume {goal_id}");
+    } else {
+        println!(
+            "  (No workspace bound — use `lim loop-daemon sync --workspace <path> {goal_id}` to bind one.)"
+        );
+    }
+    Ok(())
+}
+
+/// `lim loop-daemon list`
+async fn run_daemon_list(storage: Option<Utf8PathBuf>) -> anyhow::Result<()> {
+    let storage_root = resolve_storage_root(storage);
+    let ledger = DaemonLedger::new(storage_root.clone());
+    let goals = ledger.list_goals().await?;
+
+    if goals.is_empty() {
+        println!("No goals found in daemon ledger ({storage_root}).");
+        return Ok(());
+    }
+
+    println!("Found {} goal(s) in daemon ledger:", goals.len());
+    println!("  Storage: {storage_root}");
+    println!();
+    println!("{:<26} {:<12} {:>8} {:>12}  GOAL", "GOAL_ID", "STATUS", "SESSIONS", "TOKENS",);
+    for (goal_id, state) in &goals {
+        let status = format_goal_status_short(&state.status);
+        let goal_preview = if state.goal.len() > 50 {
+            format!("{}...", &state.goal[..47])
+        } else {
+            state.goal.clone()
+        };
+        println!(
+            "{goal_id:<26} {status:<12} {:>8} {:>12}  {goal_preview}",
+            state.session_count, state.total_tokens,
+        );
+    }
+    Ok(())
+}
+
+/// `lim loop-daemon status <ID>`
+async fn run_daemon_status(
+    goal_id_str: String,
+    storage: Option<Utf8PathBuf>,
+) -> anyhow::Result<()> {
+    let goal_id: GoalId = goal_id_str.parse().map_err(|e| {
+        lim_core::error::LimError::Config(format!("invalid goal ID `{goal_id_str}`: {e}"))
+    })?;
+    let storage_root = resolve_storage_root(storage);
+    let ledger = DaemonLedger::new(storage_root.clone());
+    let state = ledger.load(&goal_id).await?;
+
+    println!("Goal ID:      {goal_id}");
+    println!("Goal:         {}", state.goal);
+    println!("Status:       {}", format_goal_status(&state.status));
+    println!("Sessions:     {}", state.session_count);
+    println!("Turns:        {}", state.turn_count);
+    println!("Tokens:       {}", state.total_tokens);
+    println!("Created:      {}", format_unix_seconds(state.created_at));
+    println!("Updated:      {}", format_unix_seconds(state.updated_at));
+    if let Some(sid) = state.last_session_id {
+        println!("Last session: {sid}");
+    }
+    println!("Storage:      {storage_root}/{goal_id}/");
+
+    // Show workspace binding if any.
+    if let Ok(Some(binding)) = ledger.workspace_binding(&goal_id).await {
+        println!();
+        println!("Workspace binding:");
+        println!("  Root:    {}", binding.workspace_root);
+        println!("  Primary: {}", binding.primary);
+        println!("  Bound:   {}", format_unix_seconds(binding.bound_at));
+    }
+    Ok(())
+}
+
+/// `lim loop-daemon pause <ID> [--reason "..."]`
+async fn run_daemon_pause(
+    goal_id_str: String,
+    reason: Option<String>,
+    storage: Option<Utf8PathBuf>,
+) -> anyhow::Result<()> {
+    let goal_id: GoalId = goal_id_str.parse().map_err(|e| {
+        lim_core::error::LimError::Config(format!("invalid goal ID `{goal_id_str}`: {e}"))
+    })?;
+    let storage_root = resolve_storage_root(storage);
+    let ledger = DaemonLedger::new(storage_root);
+
+    let mut state = ledger.load(&goal_id).await?;
+    state.status = GoalStatus::Paused;
+    ledger.save(&goal_id, &state).await?;
+
+    println!("Paused goal: {goal_id}");
+    if let Some(reason) = reason {
+        println!("  Reason: {reason}");
+    }
+    println!("  Resume with: lim loop-daemon resume {goal_id}");
+    Ok(())
+}
+
+/// `lim loop-daemon resume <ID>`
+async fn run_daemon_resume(
+    goal_id_str: String,
+    storage: Option<Utf8PathBuf>,
+) -> anyhow::Result<()> {
+    let goal_id: GoalId = goal_id_str.parse().map_err(|e| {
+        lim_core::error::LimError::Config(format!("invalid goal ID `{goal_id_str}`: {e}"))
+    })?;
+    let storage_root = resolve_storage_root(storage);
+    let ledger = DaemonLedger::new(storage_root);
+
+    let mut state = ledger.load(&goal_id).await?;
+    if !matches!(state.status, GoalStatus::Paused) {
+        return Err(lim_core::error::LimError::Config(format!(
+            "goal {goal_id} is not paused (current: {})",
+            format_goal_status(&state.status),
+        ))
+        .into());
+    }
+    state.status = GoalStatus::Running;
+    ledger.save(&goal_id, &state).await?;
+
+    println!("Resumed goal: {goal_id}");
+    println!("  Note: this only flips the status flag. To actually run sessions,");
+    println!(
+        "  use `lim loop-daemon sync {goal_id}` then `lim loop --resume {goal_id}` in the workspace."
+    );
+    Ok(())
+}
+
+/// `lim loop-daemon sync <ID> [--workspace <path>]`
+async fn run_daemon_sync(
+    goal_id_str: String,
+    workspace_override: Option<Utf8PathBuf>,
+    storage: Option<Utf8PathBuf>,
+) -> anyhow::Result<()> {
+    let goal_id: GoalId = goal_id_str.parse().map_err(|e| {
+        lim_core::error::LimError::Config(format!("invalid goal ID `{goal_id_str}`: {e}"))
+    })?;
+    let storage_root = resolve_storage_root(storage);
+    let ledger = DaemonLedger::new(storage_root.clone());
+
+    let workspace_root = match workspace_override {
+        Some(ws) => ws,
+        None => match ledger.workspace_binding(&goal_id).await? {
+            Some(binding) => binding.workspace_root,
+            None => {
+                return Err(lim_core::error::LimError::Config(format!(
+                    "goal {goal_id} has no workspace binding; pass --workspace <path>",
+                ))
+                .into());
+            }
+        },
+    };
+
+    let dest = ledger.sync_to_workspace(&goal_id, &workspace_root).await?;
+
+    println!("Synced goal: {goal_id}");
+    println!("  From: {storage_root}/{goal_id}/");
+    println!("  To:   {dest}");
+    println!();
+    println!("The goal is now visible to workspace-local tools:");
+    println!("  cd {workspace_root}");
+    println!("  lim loop --status {goal_id}");
+    println!("  lim loop --resume {goal_id}");
     Ok(())
 }

@@ -107,11 +107,8 @@ impl OpenAiChatProvider {
         });
 
         if !request.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(convert_tool_schema)
-                .collect();
+            let tools: Vec<serde_json::Value> =
+                request.tools.iter().map(convert_tool_schema).collect();
             body["tools"] = serde_json::Value::Array(tools);
         }
 
@@ -154,6 +151,17 @@ impl Provider for OpenAiChatProvider {
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
+            let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let msg_count =
+                body.get("messages").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            tracing::debug!(
+                url = %url,
+                model = %model,
+                message_count = msg_count,
+                "openai chat: sending request"
+            );
+            tracing::trace!(body = ?body, "openai chat request body");
+
             let mut req_builder = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {api_key}"))
@@ -176,16 +184,23 @@ impl Provider for OpenAiChatProvider {
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let text = response.text().await.unwrap_or_default();
+                tracing::debug!(status, body = %text, "openai chat: HTTP error response");
                 let _ = tx.send(Err(classify_http_error(status, &text))).await;
                 return;
             }
 
+            tracing::debug!(status = response.status().as_u16(), "openai chat: stream started");
             let mut state = ChatStreamState::default();
             let mut stream = sse_event_stream(response);
 
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(event) => {
+                        tracing::trace!(
+                            event_type = %event.event,
+                            data_len = event.data.len(),
+                            "openai chat SSE event"
+                        );
                         // Detect provider/proxy errors embedded as SSE
                         // events (HTTP 200 + error event). Without this,
                         // malformed streams would be silently dropped as
@@ -212,10 +227,24 @@ impl Provider for OpenAiChatProvider {
     }
 
     fn model_metadata(&self, model: &str) -> ModelMetadata {
+        // OpenAI o-series + OpenAI-compatible thinking models all stream
+        // reasoning via `delta.reasoning_content`. Metadata here only flags
+        // capability; actual parsing in `parse_event` is unconditional, so
+        // unknown thinking models still work — they just report
+        // `supports_thinking: false` until added here.
         let (ctx, max_out, thinking) = match model {
+            // OpenAI o-series
             m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => {
                 (200_000, 100_000, true)
             }
+            // DeepSeek-reasoner (R1 / V3 thinking)
+            m if m.starts_with("deepseek-reasoner") => (64_000, 32_768, true),
+            // Qwen3 thinking variants (qwq, qwen3-reasoning, etc.)
+            m if m.starts_with("qwq") || m.contains("-thinking") => (131_072, 32_768, true),
+            // GLM-4.5+ thinking variants
+            m if m.starts_with("glm-4.5") || m.starts_with("glm-4.6") => (128_000, 32_768, true),
+            // Kimi K2 thinking
+            m if m.starts_with("kimi-k2") => (128_000, 32_768, true),
             m if m.starts_with("gpt-4o") => (128_000, 16_384, false),
             m if m.starts_with("gpt-4.1") => (1_047_576, 32_768, false),
             _ => (128_000, 8_192, false),
@@ -249,24 +278,27 @@ impl ChatStreamState {
         let data = &event.data;
 
         if data == "[DONE]" {
-            return vec![StreamEvent::Done {
-                stop_reason: StopReason::EndTurn,
-            }];
+            return vec![StreamEvent::Done { stop_reason: StopReason::EndTurn }];
         }
 
         let chunk: OpenAiChunk = match serde_json::from_str(data) {
             Ok(c) => c,
-            Err(_) => return vec![],
+            Err(e) => {
+                tracing::warn!(
+                    data_len = data.len(),
+                    error = %e,
+                    "openai chat SSE: failed to parse JSON chunk, dropping event"
+                );
+                return vec![];
+            }
         };
 
         let mut events = Vec::new();
 
         // Usage (arrives in final chunk when stream_options.include_usage = true)
         if let Some(usage) = chunk.usage {
-            events.push(StreamEvent::Usage(Usage::new(
-                usage.prompt_tokens,
-                usage.completion_tokens,
-            )));
+            events
+                .push(StreamEvent::Usage(Usage::new(usage.prompt_tokens, usage.completion_tokens)));
         }
 
         if let Some(choice) = chunk.choices.first() {
@@ -276,9 +308,17 @@ impl ChatStreamState {
             if let Some(ref content) = delta.content
                 && !content.is_empty()
             {
-                events.push(StreamEvent::TextDelta {
-                    text: content.clone(),
-                });
+                events.push(StreamEvent::TextDelta { text: content.clone() });
+            }
+
+            // Reasoning content (o-series + OpenAI-compatible thinking models:
+            // DeepSeek-reasoner, Qwen3, GLM-4.5, Kimi, etc.). Streamed in
+            // parallel to `content` and surfaced as ThinkingDelta so downstream
+            // can render it separately from the final answer.
+            if let Some(ref reasoning) = delta.reasoning_content
+                && !reasoning.is_empty()
+            {
+                events.push(StreamEvent::ThinkingDelta { text: reasoning.clone() });
             }
 
             // Tool calls — keyed by `index`, not `id`
@@ -304,16 +344,10 @@ impl ChatStreamState {
                     // If this delta has an `id` or `function.name`, it's the
                     // first chunk for this tool call → emit ToolCallStart
                     let has_id = tc.id.is_some();
-                    let name = tc
-                        .function
-                        .as_ref()
-                        .and_then(|f| f.name.clone());
+                    let name = tc.function.as_ref().and_then(|f| f.name.clone());
 
                     if has_id || name.is_some() {
-                        events.push(StreamEvent::ToolCallStart {
-                            id: id.clone(),
-                            name,
-                        });
+                        events.push(StreamEvent::ToolCallStart { id: id.clone(), name });
                     }
 
                     // Arguments delta (fragment of JSON string)
@@ -364,6 +398,11 @@ struct OpenAiChoice {
 struct OpenAiDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning / thinking content emitted by o-series and OpenAI-compatible
+    /// thinking models (DeepSeek-reasoner, Qwen3, GLM-4.5, Kimi, etc.).
+    /// Streamed via `delta.reasoning_content`, parallel to `delta.content`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
@@ -393,9 +432,7 @@ struct OpenAiUsage {
 fn classify_http_error(status: u16, body: &str) -> ProviderError {
     match status {
         401 | 403 => ProviderError::Auth(body.to_string()),
-        429 => ProviderError::RateLimited {
-            retry_after_ms: None,
-        },
+        429 => ProviderError::RateLimited { retry_after_ms: None },
         400 => {
             if body.contains("context_length") || body.contains("context window") {
                 ProviderError::ContextWindowExceeded
@@ -405,10 +442,7 @@ fn classify_http_error(status: u16, body: &str) -> ProviderError {
         }
         402 => ProviderError::QuotaExceeded,
         502 | 503 => ProviderError::ServerOverloaded,
-        _ => ProviderError::Api {
-            status,
-            message: body.to_string(),
-        },
+        _ => ProviderError::Api { status, message: body.to_string() },
     }
 }
 
@@ -423,10 +457,7 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> serde_json::Value {
             serde_json::json!({"role": "system", "content": text})
         }
         Role::User => {
-            let has_image = msg
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Image { .. }));
+            let has_image = msg.content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
 
             if has_image {
                 let parts: Vec<serde_json::Value> = msg
@@ -437,7 +468,7 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> serde_json::Value {
                             Some(serde_json::json!({"type": "text", "text": text}))
                         }
                         ContentBlock::Image { data, mime_type } => {
-                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            use base64::{Engine, engine::general_purpose::STANDARD};
                             let b64 = STANDARD.encode(data);
                             Some(serde_json::json!({
                                 "type": "image_url",
@@ -454,6 +485,11 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> serde_json::Value {
             }
         }
         Role::Assistant => {
+            // Note: `ContentBlock::Thinking` is intentionally NOT serialized
+            // back to the API. All thinking models (o-series, DeepSeek-reasoner,
+            // Qwen3, GLM, Kimi) treat `reasoning_content` as ephemeral — it is
+            // regenerated each turn and must not be echoed back. Dropping it
+            // here matches every compatible provider's documented contract.
             let text_parts: Vec<&str> = msg
                 .content
                 .iter()
@@ -467,11 +503,7 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> serde_json::Value {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => Some(serde_json::json!({
+                    ContentBlock::ToolCall { id, name, arguments } => Some(serde_json::json!({
                         "id": id.to_string(),
                         "type": "function",
                         "function": {
@@ -496,11 +528,8 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> serde_json::Value {
         }
         Role::Tool => {
             let text = extract_text(&msg.content);
-            let tool_call_id = msg
-                .tool_call_ids
-                .first()
-                .map(|id| id.to_string())
-                .unwrap_or_default();
+            let tool_call_id =
+                msg.tool_call_ids.first().map(|id| id.to_string()).unwrap_or_default();
 
             serde_json::json!({
                 "role": "tool",
@@ -566,16 +595,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_reasoning_content_delta() {
+        // OpenAI-compatible thinking models (o-series, DeepSeek-reasoner,
+        // Qwen3, GLM-4.5, Kimi, etc.) stream thinking via `reasoning_content`,
+        // parallel to `content`. We emit it as ThinkingDelta so the UI can
+        // render it separately from the final answer.
+        let data = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"Let me think..."},"finish_reason":null}]}"#;
+        let mut state = ChatStreamState::default();
+        let events = parse(data, &mut state);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ThinkingDelta { text } => assert_eq!(text, "Let me think..."),
+            _ => panic!("expected ThinkingDelta"),
+        }
+    }
+
+    #[test]
+    fn parse_reasoning_and_text_in_same_chunk() {
+        // Some providers emit reasoning_content and content in the same chunk
+        // (e.g. when content starts immediately after thinking ends). Both
+        // events should be emitted — order in the events vector follows the
+        // parser's check order (content first, then reasoning_content).
+        let data = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"thinking...","content":"answer"},"finish_reason":null}]}"#;
+        let mut state = ChatStreamState::default();
+        let events = parse(data, &mut state);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StreamEvent::TextDelta { .. }));
+        assert!(matches!(events[1], StreamEvent::ThinkingDelta { .. }));
+    }
+
+    #[test]
     fn parse_done() {
         let mut state = ChatStreamState::default();
         let events = parse("[DONE]", &mut state);
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            StreamEvent::Done {
-                stop_reason: StopReason::EndTurn
-            }
-        ));
+        assert!(matches!(events[0], StreamEvent::Done { stop_reason: StopReason::EndTurn }));
     }
 
     #[test]
@@ -586,9 +640,7 @@ mod tests {
         // Usage + Done
         assert_eq!(events.len(), 2);
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Usage(_))));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::Done { .. })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Done { .. })));
     }
 
     /// Reproduces the original P0 bug: tool call deltas must carry the same
@@ -637,9 +689,11 @@ mod tests {
         // Fourth chunk: finish_reason = "tool_calls"
         let chunk4 = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
         let events4 = parse(chunk4, &mut state);
-        assert!(events4
-            .iter()
-            .any(|e| matches!(e, StreamEvent::Done { stop_reason: StopReason::ToolCall })));
+        assert!(
+            events4
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Done { stop_reason: StopReason::ToolCall }))
+        );
     }
 
     /// When the provider omits the `id` field (some proxies do), we fall
@@ -738,22 +792,13 @@ mod tests {
 
     #[test]
     fn http_error_classification() {
-        assert!(matches!(
-            classify_http_error(401, "bad key"),
-            ProviderError::Auth(_)
-        ));
-        assert!(matches!(
-            classify_http_error(429, "slow down"),
-            ProviderError::RateLimited { .. }
-        ));
+        assert!(matches!(classify_http_error(401, "bad key"), ProviderError::Auth(_)));
+        assert!(matches!(classify_http_error(429, "slow down"), ProviderError::RateLimited { .. }));
         assert!(matches!(
             classify_http_error(400, "context_length exceeded"),
             ProviderError::ContextWindowExceeded
         ));
-        assert!(matches!(
-            classify_http_error(503, "overloaded"),
-            ProviderError::ServerOverloaded
-        ));
+        assert!(matches!(classify_http_error(503, "overloaded"), ProviderError::ServerOverloaded));
     }
 
     #[test]
@@ -773,6 +818,26 @@ mod tests {
         assert!(meta.supports_thinking);
     }
 
+    #[test]
+    fn model_metadata_for_compatible_thinking_models() {
+        let provider = OpenAiChatProvider::new("test-key");
+        // DeepSeek-reasoner
+        let meta = provider.model_metadata("deepseek-reasoner");
+        assert!(meta.supports_thinking);
+        // Qwen3 qwq
+        let meta = provider.model_metadata("qwq-32b");
+        assert!(meta.supports_thinking);
+        // GLM-4.5
+        let meta = provider.model_metadata("glm-4.5");
+        assert!(meta.supports_thinking);
+        // Kimi K2
+        let meta = provider.model_metadata("kimi-k2");
+        assert!(meta.supports_thinking);
+        // Non-thinking model stays false
+        let meta = provider.model_metadata("deepseek-chat");
+        assert!(!meta.supports_thinking);
+    }
+
     // --- endpoint() resolution tests ---
 
     #[test]
@@ -783,22 +848,15 @@ mod tests {
 
     #[test]
     fn endpoint_falls_back_to_base_url_suffix() {
-        let p = OpenAiChatProvider::new("key")
-            .with_base_url("https://api.deepseek.com");
-        assert_eq!(
-            p.endpoint(),
-            "https://api.deepseek.com/v1/chat/completions"
-        );
+        let p = OpenAiChatProvider::new("key").with_base_url("https://api.deepseek.com");
+        assert_eq!(p.endpoint(), "https://api.deepseek.com/v1/chat/completions");
     }
 
     #[test]
     fn endpoint_uses_full_url_when_set() {
         let p = OpenAiChatProvider::new("key")
             .with_full_url("https://proxy.example.com/custom/path?key=1");
-        assert_eq!(
-            p.endpoint(),
-            "https://proxy.example.com/custom/path?key=1"
-        );
+        assert_eq!(p.endpoint(), "https://proxy.example.com/custom/path?key=1");
     }
 
     #[test]
@@ -812,11 +870,7 @@ mod tests {
 
     #[test]
     fn endpoint_trims_trailing_slash_from_base_url() {
-        let p = OpenAiChatProvider::new("key")
-            .with_base_url("https://api.deepseek.com/");
-        assert_eq!(
-            p.endpoint(),
-            "https://api.deepseek.com/v1/chat/completions"
-        );
+        let p = OpenAiChatProvider::new("key").with_base_url("https://api.deepseek.com/");
+        assert_eq!(p.endpoint(), "https://api.deepseek.com/v1/chat/completions");
     }
 }

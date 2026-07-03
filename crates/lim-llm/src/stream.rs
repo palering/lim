@@ -24,10 +24,7 @@ pub enum StreamEvent {
     /// same delta, but some compatible providers split them). The accumulator
     /// will accept a second `ToolCallStart` with the same `id` to fill in the
     /// name if it was initially `None`.
-    ToolCallStart {
-        id: ToolCallId,
-        name: Option<String>,
-    },
+    ToolCallStart { id: ToolCallId, name: Option<String> },
 
     /// Incremental JSON argument fragment for an in-progress tool call.
     ToolCallDelta {

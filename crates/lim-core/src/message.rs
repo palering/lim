@@ -68,7 +68,11 @@ impl AgentMessage {
     }
 
     /// Create a tool result message.
-    pub fn tool_result(tool_call_id: ToolCallId, output: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool_result(
+        tool_call_id: ToolCallId,
+        output: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         Self {
             id: MessageId::new(),
             role: Role::Tool,
@@ -94,12 +98,7 @@ impl AgentMessage {
         self.content
             .iter()
             .filter_map(|block| {
-                if let ContentBlock::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } = block
-                {
+                if let ContentBlock::ToolCall { id, name, arguments } = block {
                     Some((id.clone(), name.as_str(), arguments))
                 } else {
                     None
@@ -147,10 +146,7 @@ impl LlmMessage {
 /// sending to the provider, preserving the full agent message history for
 /// UI, session, and replay purposes.
 pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<LlmMessage> {
-    messages
-        .iter()
-        .filter_map(LlmMessage::from_agent_message)
-        .collect()
+    messages.iter().filter_map(LlmMessage::from_agent_message).collect()
 }
 
 /// Metadata attached to a completed assistant turn.

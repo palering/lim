@@ -1,7 +1,7 @@
 # lim — Implementation Progress
 
 > Last updated: 2026-06-30
-> Workspace: 10 crates, 198 tests, 0 clippy warnings
+> Workspace: 10 crates, 262 tests, 0 clippy warnings
 > Details: [docs/archive/completed-phases.md](docs/archive/completed-phases.md)
 
 ## Completed
@@ -133,6 +133,45 @@ Critical fixes verified against real LLM endpoints:
 - 3 unit tests cover retry-success / no-retry-on-auth / retry-exhaustion (use `#[tokio::test(start_paused = true)]` for instant backoff)
 - TUI shows `⚠ <msg>  (retry N/M)` during retries, `⚠ <msg>  (retries exhausted: N/M)` on final failure
 
+### Phase 3c: Behavior Observability + Platform Abstraction — DONE
+
+Two work streams hardening lim against black-box behavior.
+
+**Behavior Trace & Observability — `docs/architecture/behavior-trace.md`**
+
+- 6 design principles established (Behavior Traceable / Implicit Made Explicit / No Silent Failure / Layered Observability / Closed Enum / Lock-Free Across Await)
+- All silent-failure paths in 3 providers' SSE parsers + StreamAccumulator now emit `warn!` instead of silently dropping events
+- Implicit behaviors made explicit: `ToolRegistry::schemas()` now sorted by name (was HashMap order); `ApprovalHooks::Reject` and schema validation failures now emit `ToolExecutionStart` + `ToolExecutionEnd` (were silent returns)
+- `AgentEvent::TurnStart` extended with `model` / `message_count` / `tool_count` / `tool_names` / `system_prompt_len` for self-auditing
+- `AgentEvent::ToolExecutionStart` / `ToolExecutionEnd` now carry Unix ms timestamps (`started_at` / `ended_at`)
+- 3 LLM providers (OpenAI Chat / OpenAI Responses / Anthropic) instrumented with `debug!` (request URL/model/message_count) + `trace!` (request body, SSE events) + `debug!` (HTTP error response, stream started)
+- Context compaction's hidden LLM call now logs `debug!` (start) and `warn!` (stream error)
+- Document includes PR-review checklist (§9) and phase-review checklist (§10) for ongoing observability discipline
+
+**Platform Abstraction — `crates/lim-core/src/{env,inject}.rs` + `crates/lim-tools/src/shell.rs`**
+
+- `PlatformInfo` (env module) — immutable startup snapshot of OS / arch / shell / workspace_roots. Detection layer, decoupled from injection
+- `InjectInfo` (inject module) — application layer that renders `PlatformInfo` into a system-prompt fragment with per-shell guidance (POSIX/BSD-vs-GNU differences, Git Bash drive mounts, WSL `/mnt/`, PowerShell cmdlets)
+- `ShellBackend` trait + 4 implementations: `PosixSh` (Unix default), `GitBash` (Windows priority 1), `Wsl` (priority 2), `PowerShell` (priority 3 fallback). `cmd.exe` intentionally never used — no mainstream agent uses it
+- `BashTool` renamed to `ShellTool` (tool name `"bash"` → `"shell"`). Single tool exposed to LLM; backend selected once at startup and held as `Arc<dyn ShellBackend>` for the session
+- `apps/cli` and `apps/tui` now detect platform at startup, inject the fragment into the system prompt, and print platform info to stderr for user visibility
+- +22 tests (198→262): 8 env + 8 inject + 9 shell backend/tool
+
+**Compaction Observability — `crates/lim-agent/src/context_window.rs`**
+
+- `ContextCompacted` event extended with `summary_model` / `summary_prompt_tokens` / `summary_completion_tokens` — closes the last black-box point in behavior-trace.md §8.1
+- `summarize()` now returns `(String, Usage)` capturing the provider's token usage report
+- TUI status bar shows `summary cost: N tokens via MODEL` on compaction
+- behavior-trace.md §8.1 upgraded from "部分黑盒" to "✅ 完全可观测"
+
+### Packaging Phase A Preparation — DONE
+
+- `[profile.release]` in `Cargo.toml`: `lto = "fat"` / `codegen-units = 1` / `strip = "symbols"` / `panic = "abort"`. Release binary: `lim` 5.4M / `novel-cli` 4.6M
+- `.github/workflows/ci.yml`: fmt check + clippy (-D warnings) + build + test + cross-compile check (Windows + macOS targets)
+- `.github/workflows/release.yml`: 6-target matrix (Linux x86_64/ARM64 + Windows x86_64/ARM64 + macOS ARM64/x86_64) + GitHub Release upload via `softprops/action-gh-release`
+- `docs/packaging-plan.md` updated: 3/4 code blockers marked ✅ DONE, open questions expanded
+- Remaining before first release: fix repo URL placeholder, add LICENSE + README.md, verify reqwest rustls-tls cross-compilation on CI
+
 ## Planned
 
 ### Phase 4: Strong Isolation & External Tools
@@ -154,14 +193,15 @@ Acceptance:
 
 | Crate | Layer | Phase | Tests |
 | :--- | :--- | :--- | :--- |
-| lim-core | Foundation | 1+3 | 33 |
-| lim-llm | Foundation | 1+3 | 61 |
-| lim-agent | Core | 1+3 | 35 |
-| lim-executor | Core | 1 | 6 |
-| lim-tools | Core | 1 | 0 |
-| lim-session | Core | 1+3 | 11 |
-| lim-workflow | Orchestration | 2 | 22 |
-| lim (apps/cli) | Entry | 1+3 | 0 |
-| lim-tui (apps/tui) | Frontend | 3 | 11 |
+| lim-core | Foundation | 1+3 | 53 (env 8 + inject 8 + usage 2 + others) |
+| lim-llm | Foundation | 1+3 | 66 (3 providers + http + error) |
+| lim-agent | Core | 1+3 | 49 (agent_loop + context_window + registry + stream_accumulator + hooks) |
+| lim-executor | Core | 1 | 16 (local + executor trait) |
+| lim-tools | Core | 1+3 | 8 (shell + read + write + edit) |
+| lim-session | Core | 1+3 | 11 (writer + replay) |
+| lim-workflow | Orchestration | 2 | 22 (DAG executor + artifact store) |
+| lim (apps/cli) | Entry | 1+3 | 0 (integration tests in /tests) |
+| lim-tui (apps/tui) | Frontend | 3 | 18 (app + ui + approval) |
 | novel-pack (packs/novel) | Domain | 2 | 15 |
-| **Total** | | | **194** (+4 integration) = **198** |
+| tests/ (integration) | | | 4 (config_integration) |
+| **Total** | | | **262** |

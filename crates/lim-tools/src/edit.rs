@@ -14,6 +14,7 @@ pub struct EditFileTool {
 }
 
 impl EditFileTool {
+    /// Create a new [`EditFileTool`] backed by the given executor.
     pub fn new(executor: Arc<dyn Executor>) -> Self {
         Self { executor }
     }
@@ -61,29 +62,17 @@ impl Tool for EditFileTool {
     ) -> ToolFuture<Result<ToolResult>> {
         let executor = Arc::clone(&self.executor);
         Box::pin(async move {
-            let path_str = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| LimError::ToolExecution {
-                    name: "edit".to_string(),
-                    message: "missing required argument: path".to_string(),
-                })?;
+            let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                LimError::tool_execution_msg("edit", "missing required argument: path")
+            })?;
 
-            let old_string = args
-                .get("old_string")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| LimError::ToolExecution {
-                    name: "edit".to_string(),
-                    message: "missing required argument: old_string".to_string(),
-                })?;
+            let old_string = args.get("old_string").and_then(|v| v.as_str()).ok_or_else(|| {
+                LimError::tool_execution_msg("edit", "missing required argument: old_string")
+            })?;
 
-            let new_string = args
-                .get("new_string")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| LimError::ToolExecution {
-                    name: "edit".to_string(),
-                    message: "missing required argument: new_string".to_string(),
-                })?;
+            let new_string = args.get("new_string").and_then(|v| v.as_str()).ok_or_else(|| {
+                LimError::tool_execution_msg("edit", "missing required argument: new_string")
+            })?;
 
             let edit = FileEdit {
                 path: Utf8PathBuf::from(path_str),

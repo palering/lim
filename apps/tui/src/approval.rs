@@ -38,7 +38,7 @@ use lim_agent::hooks::{AgentHooks, BeforeToolDecision, HookFuture};
 use lim_agent::registry::ToolRegistry;
 use lim_core::error::Result;
 use lim_core::guard::{ToolGuard, TrustLevel};
-use lim_core::tool::{ToolCategory, ToolCall, ToolResult};
+use lim_core::tool::{ToolCall, ToolCategory, ToolResult};
 
 /// Tool approval mode — controls which tool categories require user prompts.
 ///
@@ -88,7 +88,9 @@ impl ApprovalMode {
             Self::Always => true,
             Self::AllowReadOnly => category != ToolCategory::ReadOnly,
             Self::AllowNonScript => matches!(category, ToolCategory::Script | ToolCategory::Remote),
-            Self::AllowNonNetwork => matches!(category, ToolCategory::Network | ToolCategory::Remote),
+            Self::AllowNonNetwork => {
+                matches!(category, ToolCategory::Network | ToolCategory::Remote)
+            }
         }
     }
 }
@@ -119,10 +121,12 @@ impl Clone for ApprovalRequest {
 }
 
 impl ApprovalRequest {
+    /// The tool name being requested for approval.
     pub fn tool_name(&self) -> &str {
         &self.tool_name
     }
 
+    /// The arguments to be passed to the tool.
     pub fn arguments(&self) -> &serde_json::Value {
         &self.arguments
     }
@@ -130,9 +134,10 @@ impl ApprovalRequest {
     /// Take the reply sender and send a response. No-op if already taken.
     pub fn respond(&self, response: ApprovalResponse) {
         if let Ok(mut guard) = self.respond.lock()
-            && let Some(sender) = guard.take() {
-                let _ = sender.send(response);
-            }
+            && let Some(sender) = guard.take()
+        {
+            let _ = sender.send(response);
+        }
     }
 }
 
@@ -166,22 +171,27 @@ pub struct ToolLists {
 }
 
 impl ToolLists {
+    /// Create an empty `ToolLists`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Add a tool to the allowlist (skip prompt even if mode would prompt).
     pub fn allow(&mut self, name: impl Into<String>) {
         self.allowlist.insert(name.into());
     }
 
+    /// Add a tool to the denylist (reject immediately, highest priority).
     pub fn deny(&mut self, name: impl Into<String>) {
         self.denylist.insert(name.into());
     }
 
+    /// Remove a tool from the allowlist.
     pub fn clear_allow(&mut self, name: &str) {
         self.allowlist.remove(name);
     }
 
+    /// Remove a tool from the denylist.
     pub fn clear_deny(&mut self, name: &str) {
         self.denylist.remove(name);
     }
@@ -211,19 +221,15 @@ pub struct ApprovalHooks {
 }
 
 impl ApprovalHooks {
+    /// Create a new [`ApprovalHooks`] with the given TUI channel, shared mode,
+    /// tool registry, and allow/deny lists.
     pub fn new(
         tx: mpsc::Sender<ApprovalRequest>,
         mode: Arc<Mutex<ApprovalMode>>,
         registry: Arc<ToolRegistry>,
         lists: SharedToolLists,
     ) -> Self {
-        Self {
-            tx,
-            mode,
-            registry,
-            lists,
-            guard: None,
-        }
+        Self { tx, mode, registry, lists, guard: None }
     }
 
     /// Attach a `ToolGuard` to enable Trust × ApprovalMode linkage.
@@ -252,11 +258,11 @@ impl ApprovalHooks {
         let mode = self.mode.lock().map(|g| *g).unwrap_or(ApprovalMode::AllowNonScript);
         if let Some(ref guard) = self.guard
             && guard.trust_level() == TrustLevel::Permissive
-                && mode != ApprovalMode::Always
-            {
-                // Linkage rule: Permissive requires Always
-                return ApprovalMode::Always;
-            }
+            && mode != ApprovalMode::Always
+        {
+            // Linkage rule: Permissive requires Always
+            return ApprovalMode::Always;
+        }
         mode
     }
 }
@@ -288,9 +294,7 @@ impl AgentHooks for ApprovalHooks {
             // 3. ApprovalMode + ToolCategory.
             // Look up the tool's category; unknown tools default to Script
             // (conservative — treat as most dangerous category).
-            let category = registry
-                .category_of(&call.name)
-                .unwrap_or(ToolCategory::Script);
+            let category = registry.category_of(&call.name).unwrap_or(ToolCategory::Script);
 
             if !mode.requires_approval(category) {
                 return Ok(BeforeToolDecision::Proceed);
@@ -307,9 +311,7 @@ impl AgentHooks for ApprovalHooks {
 
             if tx.send(request).await.is_err() {
                 // TUI dropped — fail closed (reject).
-                return Ok(BeforeToolDecision::Reject(
-                    "approval channel closed".to_string(),
-                ));
+                return Ok(BeforeToolDecision::Reject("approval channel closed".to_string()));
             }
 
             match resp_rx.await {
@@ -318,9 +320,7 @@ impl AgentHooks for ApprovalHooks {
                 Ok(ApprovalResponse::Deny) => {
                     Ok(BeforeToolDecision::Reject("denied by user".to_string()))
                 }
-                Err(_) => Ok(BeforeToolDecision::Reject(
-                    "approval response dropped".to_string(),
-                )),
+                Err(_) => Ok(BeforeToolDecision::Reject("approval response dropped".to_string())),
             }
         })
     }
@@ -523,9 +523,8 @@ mod tests {
         };
 
         let call_clone = call.clone();
-        let hook_task = tokio::spawn(async move {
-            hooks.before_tool_call(&call_clone).await.unwrap()
-        });
+        let hook_task =
+            tokio::spawn(async move { hooks.before_tool_call(&call_clone).await.unwrap() });
 
         let request = rx.recv().await.expect("should receive request");
         assert_eq!(request.tool_name, "read");

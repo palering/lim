@@ -5,11 +5,11 @@
 
 use std::io::{self, Stdout};
 
-use anyhow::Result;
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use lim_core::error::{LimError, Result};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -24,10 +24,12 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     /// Enter alternate screen + raw mode, return a guard holding the terminal.
     pub fn init() -> Result<Self> {
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        enable_raw_mode().map_err(|e| LimError::terminal("enable raw mode", e))?;
+        execute!(io::stdout(), EnterAlternateScreen)
+            .map_err(|e| LimError::terminal("enter alternate screen", e))?;
         let backend = CrosstermBackend::new(io::stdout());
-        let terminal = Terminal::new(backend)?;
+        let terminal =
+            Terminal::new(backend).map_err(|e| LimError::terminal("create terminal backend", e))?;
         Ok(Self { terminal })
     }
 }

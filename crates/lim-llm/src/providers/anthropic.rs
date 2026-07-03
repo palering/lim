@@ -119,11 +119,8 @@ impl AnthropicProvider {
         }
 
         if !request.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(convert_tool_schema)
-                .collect();
+            let tools: Vec<serde_json::Value> =
+                request.tools.iter().map(convert_tool_schema).collect();
             body["tools"] = serde_json::Value::Array(tools);
         }
 
@@ -146,6 +143,17 @@ impl Provider for AnthropicProvider {
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
+            let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let msg_count =
+                body.get("messages").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            tracing::debug!(
+                url = %url,
+                model = %model,
+                message_count = msg_count,
+                "anthropic: sending request"
+            );
+            tracing::trace!(body = ?body, "anthropic request body");
+
             let mut req_builder = client
                 .post(&url)
                 .header("x-api-key", &api_key)
@@ -168,16 +176,23 @@ impl Provider for AnthropicProvider {
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let text = response.text().await.unwrap_or_default();
+                tracing::debug!(status, body = %text, "anthropic: HTTP error response");
                 let _ = tx.send(Err(classify_http_error(status, &text))).await;
                 return;
             }
 
+            tracing::debug!(status = response.status().as_u16(), "anthropic: stream started");
             let mut state = AnthropicStreamState::default();
             let mut stream = sse_event_stream(response);
 
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(event) => {
+                        tracing::trace!(
+                            event_type = %event.event,
+                            data_len = event.data.len(),
+                            "anthropic SSE event"
+                        );
                         // Detect provider/proxy errors embedded as SSE
                         // events (HTTP 200 + error event). Without this,
                         // malformed streams would be silently dropped as
@@ -242,7 +257,15 @@ impl AnthropicStreamState {
 
         let payload: serde_json::Value = match serde_json::from_str(data) {
             Ok(v) => v,
-            Err(_) => return vec![],
+            Err(e) => {
+                tracing::warn!(
+                    event_type = event_type,
+                    data_len = data.len(),
+                    error = %e,
+                    "anthropic SSE: failed to parse JSON payload, dropping event"
+                );
+                return vec![];
+            }
         };
 
         match event_type {
@@ -297,7 +320,8 @@ impl AnthropicStreamState {
                     "input_json_delta" => {
                         // Tool call arguments fragment
                         if let Some((id, _)) = self.blocks.get(&index) {
-                            let partial = delta.get("partial_json").and_then(|v| v.as_str()).unwrap_or("");
+                            let partial =
+                                delta.get("partial_json").and_then(|v| v.as_str()).unwrap_or("");
                             vec![StreamEvent::ToolCallDelta {
                                 id: id.clone(),
                                 arguments_delta: partial.to_string(),
@@ -320,14 +344,15 @@ impl AnthropicStreamState {
                 // stop_reason + output_tokens usage
                 let mut events = Vec::new();
                 if let Some(delta) = payload.get("delta")
-                    && let Some(stop) = delta.get("stop_reason").and_then(|v| v.as_str()) {
-                        let reason = match stop {
-                            "tool_use" => StopReason::ToolCall,
-                            "max_tokens" => StopReason::MaxTokens,
-                            _ => StopReason::EndTurn,
-                        };
-                        events.push(StreamEvent::Done { stop_reason: reason });
-                    }
+                    && let Some(stop) = delta.get("stop_reason").and_then(|v| v.as_str())
+                {
+                    let reason = match stop {
+                        "tool_use" => StopReason::ToolCall,
+                        "max_tokens" => StopReason::MaxTokens,
+                        _ => StopReason::EndTurn,
+                    };
+                    events.push(StreamEvent::Done { stop_reason: reason });
+                }
                 if let Some(usage) = payload.get("usage") {
                     let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     events.push(StreamEvent::Usage(Usage::new(0, output)));
@@ -366,9 +391,7 @@ impl AnthropicStreamState {
 fn classify_http_error(status: u16, body: &str) -> ProviderError {
     match status {
         401 | 403 => ProviderError::Auth(body.to_string()),
-        429 => ProviderError::RateLimited {
-            retry_after_ms: None,
-        },
+        429 => ProviderError::RateLimited { retry_after_ms: None },
         400 => {
             if body.contains("context") || body.contains("too long") {
                 ProviderError::ContextWindowExceeded
@@ -378,10 +401,7 @@ fn classify_http_error(status: u16, body: &str) -> ProviderError {
         }
         402 => ProviderError::QuotaExceeded,
         502 | 503 | 529 => ProviderError::ServerOverloaded,
-        _ => ProviderError::Api {
-            status,
-            message: body.to_string(),
-        },
+        _ => ProviderError::Api { status, message: body.to_string() },
     }
 }
 
@@ -400,10 +420,7 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> Option<serde_json::Va
             None
         }
         Role::User => {
-            let has_image = msg
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Image { .. }));
+            let has_image = msg.content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
 
             if has_image {
                 let parts: Vec<serde_json::Value> = msg
@@ -414,7 +431,7 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> Option<serde_json::Va
                             Some(serde_json::json!({"type": "text", "text": text}))
                         }
                         ContentBlock::Image { data, mime_type } => {
-                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            use base64::{Engine, engine::general_purpose::STANDARD};
                             let b64 = STANDARD.encode(data);
                             Some(serde_json::json!({
                                 "type": "image",
@@ -460,12 +477,7 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> Option<serde_json::Va
 
             // Tool calls
             for block in &msg.content {
-                if let ContentBlock::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } = block
-                {
+                if let ContentBlock::ToolCall { id, name, arguments } = block {
                     parts.push(serde_json::json!({
                         "type": "tool_use",
                         "id": id.to_string(),
@@ -484,11 +496,8 @@ fn convert_message(msg: &lim_core::message::LlmMessage) -> Option<serde_json::Va
         Role::Tool => {
             // Tool results in Anthropic are `role: "user"` with `tool_result` content blocks
             let text = extract_text(&msg.content);
-            let tool_call_id = msg
-                .tool_call_ids
-                .first()
-                .map(|id| id.to_string())
-                .unwrap_or_default();
+            let tool_call_id =
+                msg.tool_call_ids.first().map(|id| id.to_string()).unwrap_or_default();
 
             Some(serde_json::json!({
                 "role": "user",
@@ -615,9 +624,9 @@ mod tests {
             r#"{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}"#,
         );
         let e4 = state.parse_event(&ev4);
-        assert!(e4
-            .iter()
-            .any(|e| matches!(e, StreamEvent::Done { stop_reason: StopReason::ToolCall })));
+        assert!(
+            e4.iter().any(|e| matches!(e, StreamEvent::Done { stop_reason: StopReason::ToolCall }))
+        );
     }
 
     #[test]
@@ -689,22 +698,15 @@ mod tests {
 
     #[test]
     fn endpoint_falls_back_to_base_url_suffix() {
-        let p = AnthropicProvider::new("key")
-            .with_base_url("https://anthropic-proxy.example.com");
-        assert_eq!(
-            p.endpoint(),
-            "https://anthropic-proxy.example.com/v1/messages"
-        );
+        let p = AnthropicProvider::new("key").with_base_url("https://anthropic-proxy.example.com");
+        assert_eq!(p.endpoint(), "https://anthropic-proxy.example.com/v1/messages");
     }
 
     #[test]
     fn endpoint_uses_full_url_when_set() {
         let p = AnthropicProvider::new("key")
             .with_full_url("https://proxy.example.com/custom/messages?key=1");
-        assert_eq!(
-            p.endpoint(),
-            "https://proxy.example.com/custom/messages?key=1"
-        );
+        assert_eq!(p.endpoint(), "https://proxy.example.com/custom/messages?key=1");
     }
 
     #[test]

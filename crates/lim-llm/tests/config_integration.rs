@@ -8,10 +8,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use lim_llm::providers::{
-    create_provider, LimConfig, ProviderInstanceConfig, ProviderType,
-};
 use lim_llm::Provider;
+use lim_llm::providers::{LimConfig, ProviderInstanceConfig, ProviderType, create_provider};
 
 /// Write a temp config file and return its path.
 /// The file is created in the system temp dir (not the project tree) because
@@ -79,20 +77,11 @@ model = "anthropic/claude-3.5-sonnet"
         "anthropic/claude-3.5-sonnet"
     );
     // alias resolution: cli "gpt-4o" → "openai/gpt-4o"
-    assert_eq!(
-        config.resolve_model(openrouter, Some("gpt-4o")).unwrap(),
-        "openai/gpt-4o"
-    );
+    assert_eq!(config.resolve_model(openrouter, Some("gpt-4o")).unwrap(), "openai/gpt-4o");
     // passthrough for non-alias
-    assert_eq!(
-        config.resolve_model(openrouter, Some("raw-model")).unwrap(),
-        "raw-model"
-    );
+    assert_eq!(config.resolve_model(openrouter, Some("raw-model")).unwrap(), "raw-model");
     // fallback to default_model
-    assert_eq!(
-        config.resolve_model(openrouter, None).unwrap(),
-        "gpt-4o"
-    );
+    assert_eq!(config.resolve_model(openrouter, None).unwrap(), "gpt-4o");
 
     // missing provider → error
     assert!(config.resolve_provider_name(Some("nonexistent")).is_ok());

@@ -23,8 +23,8 @@ mod messages;
 mod popup;
 mod status;
 
-use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout};
 
 use crate::app::App;
 
@@ -36,10 +36,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),    // header
-            Constraint::Min(10),      // messages (flexible)
-            Constraint::Length(4),    // input (3 lines + border)
-            Constraint::Length(2),    // status bar (2 rows)
+            Constraint::Length(1), // header
+            Constraint::Min(10),   // messages (flexible)
+            Constraint::Length(4), // input (3 lines + border)
+            Constraint::Length(2), // status bar (2 rows)
         ])
         .split(area);
 

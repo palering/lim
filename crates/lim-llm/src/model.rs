@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 pub struct ModelId(String);
 
 impl ModelId {
+    /// Create a new [`ModelId`] from the given string.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// The model identifier as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
