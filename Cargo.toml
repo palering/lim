@@ -66,7 +66,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # Schema validation
-jsonschema = "0.30"
+jsonschema = "0.46"
 
 # Base64 encoding
 base64 = "0.22"
