@@ -12,6 +12,13 @@ updates:
     labels:
       - "dependencies"
       - "github-actions"
+    groups:
+      # minor + patch 合并到单个 PR（通常无 breaking change）
+      # major 保持默认：每个依赖单独 PR（breaking change 需独立审查）
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
   # Cargo crates — keep Rust dependencies up to date
   - package-ecosystem: "cargo"
@@ -25,3 +32,10 @@ updates:
     labels:
       - "dependencies"
       - "cargo"
+    groups:
+      # minor + patch 合并到单个 PR（通常无 breaking change）
+      # major 保持默认：每个依赖单独 PR（breaking change 需独立审查）
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
