@@ -122,13 +122,37 @@ async fn summarize_compact(
     let provider: &Arc<dyn Provider> = override_provider.unwrap_or(main_provider);
     let model: &str = override_model.unwrap_or(main_model);
 
+    // Cache-safe forking: extract the system prompt text from system messages
+    // so the summarization request shares the same prefix as the main
+    // conversation. This maximizes prompt cache hits.
+    let system_prompt_text: Option<String> = if system_msgs.is_empty() {
+        None
+    } else {
+        let text: Vec<&str> = system_msgs
+            .iter()
+            .filter_map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        lim_core::content::ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .next()
+            })
+            .collect();
+        let joined = text.join("\n\n");
+        if joined.is_empty() { None } else { Some(joined) }
+    };
+
     // Generate summary of old messages (if any non-system messages exist).
     // On failure / empty response, fall back to verbatim old messages
     // (losing context is worse than exceeding the budget).
     let (summary_text, summary_usage) = if old_text.is_empty() {
         (String::new(), lim_core::usage::Usage::default())
     } else {
-        match summarize(&old_text, Arc::clone(provider), model).await {
+        match summarize(&old_text, Arc::clone(provider), model, system_prompt_text.as_deref(), &[])
+            .await
+        {
             Ok((text, usage)) if !text.trim().is_empty() => (text, usage),
             Ok((_, usage)) => {
                 warn!(
@@ -245,6 +269,13 @@ fn message_to_text(msg: &AgentMessage) -> String {
 
 /// Generate a summary of older messages using the provider.
 ///
+/// **Cache-safe forking** (Claude Code pattern): the summarization request
+/// reuses the same system prompt and tool definitions as the main
+/// conversation. This maximizes prompt cache hits — from the provider's
+/// perspective, the request looks like the previous turn with an extra
+/// compaction message appended, so the cached prefix is reused and only
+/// the new compaction instruction is billed as fresh input tokens.
+///
 /// **Note**: this makes a hidden LLM call that does NOT emit TurnStart /
 /// MessageStart / MessageEnd events. The `debug!` log + the `summary_*`
 /// fields on the subsequent `ContextCompacted` event are the observable
@@ -253,6 +284,10 @@ async fn summarize(
     conversation_text: &str,
     provider: Arc<dyn Provider>,
     model: &str,
+    // System prompt from the main conversation (for cache hit).
+    system_prompt: Option<&str>,
+    // Tool schemas from the main conversation (for cache hit).
+    tools: &[lim_core::tool::ToolSchema],
 ) -> Result<(String, lim_core::usage::Usage)> {
     let summary_prompt = format!(
         "Summarize the following conversation history concisely. \
@@ -267,11 +302,22 @@ async fn summarize(
         tool_call_ids: vec![],
     };
 
-    let request = LlmRequest::new(model, vec![llm_msg]);
+    let mut request = LlmRequest::new(model, vec![llm_msg]);
+    // Cache-safe forking: reuse the main conversation's system prompt and
+    // tools so the provider can hit the prompt cache prefix.
+    if let Some(sys) = system_prompt {
+        request = request.with_system(sys);
+    }
+    if !tools.is_empty() {
+        request = request.with_tools(tools.to_vec());
+    }
+
     debug!(
         model = model,
         conversation_chars = conversation_text.len(),
-        "context compaction: starting hidden LLM summary call"
+        has_system = system_prompt.is_some(),
+        tool_count = tools.len(),
+        "context compaction: starting cache-safe LLM summary call"
     );
     let stream = provider.stream(request);
     let events: Vec<_> = collect_stream(stream).await;

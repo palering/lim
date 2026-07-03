@@ -94,7 +94,14 @@ impl StreamAccumulator {
                 None
             }
             StreamEvent::Usage(usage) => {
-                self.usage = Some(usage);
+                // Merge instead of overwrite — Anthropic emits two Usage
+                // events per stream (message_start with input/cache fields,
+                // message_delta with output_tokens). Overwriting would lose
+                // the input_tokens from message_start.
+                match &mut self.usage {
+                    Some(existing) => existing.merge(&usage),
+                    None => self.usage = Some(usage),
+                }
                 None
             }
             StreamEvent::Done { stop_reason } => {
@@ -145,6 +152,7 @@ impl StreamAccumulator {
             content,
             tool_call_ids: Vec::new(),
             is_error: false,
+            parent_id: None,
         };
 
         (message, self.usage, self.stop_reason)
@@ -187,6 +195,26 @@ mod tests {
         }
         assert!(usage.is_some());
         assert_eq!(reason, Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn accumulate_usage_merges_across_events() {
+        // Anthropic emits two Usage events per stream:
+        //   message_start → input_tokens + cache_read + cache_creation
+        //   message_delta → output_tokens
+        // The accumulator must merge (not overwrite) so input_tokens survive.
+        let mut acc = StreamAccumulator::new();
+        acc.ingest(StreamEvent::TextDelta { text: "hi".to_string() });
+        acc.ingest(StreamEvent::Usage(Usage::with_cache_full(2529, 0, 1000, 500)));
+        acc.ingest(StreamEvent::Usage(Usage::new(0, 225)));
+        acc.ingest(StreamEvent::Done { stop_reason: StopReason::EndTurn });
+
+        let (_msg, usage, _reason) = acc.into_message();
+        let u = usage.expect("usage should be present");
+        assert_eq!(u.input_tokens, 2529, "input_tokens from message_start must survive");
+        assert_eq!(u.output_tokens, 225, "output_tokens from message_delta must be merged in");
+        assert_eq!(u.cached_tokens, 1000, "cache_read must be preserved");
+        assert_eq!(u.cache_creation_tokens, 500, "cache_creation must be preserved");
     }
 
     #[test]

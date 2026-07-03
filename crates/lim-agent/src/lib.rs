@@ -11,6 +11,7 @@ pub mod context_window;
 pub mod hooks;
 pub mod loop_runner;
 pub mod multiagent;
+pub mod prompt_builder;
 pub mod registry;
 pub mod stream_accumulator;
 pub mod tool;
@@ -36,6 +37,7 @@ pub use multiagent::{
     WorkspaceRegistry, WorktreeHandle, WorktreeId, WorktreeSpec, create_worktree,
     into_topology_arc,
 };
+pub use prompt_builder::{PromptBuilder, build_system_reminder};
 pub use registry::{ToolRegistry, validate_args};
 pub use stream_accumulator::StreamAccumulator;
 pub use tool::Tool;

@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use lim_agent::agent_loop::{AgentConfig, AgentLoop};
 use lim_agent::context_window::{ContextConfig, ContextWindowManager};
+use lim_agent::prompt_builder::PromptBuilder;
 use lim_agent::registry::ToolRegistry;
 use lim_agent::{
     AgentFactory, AgentRoleSpec, AlwaysPassVerifier, Budget, CommandVerifier, DaemonCommand,
@@ -33,7 +34,7 @@ use lim_session::{SessionDetails, SessionManager, SessionMeta};
 
 /// Lim — a Rust-native agent runtime.
 #[derive(Parser)]
-#[command(name = "lim", version, about)]
+#[command(name = "lim", version = lim_core::LIM_VERSION, about)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -814,6 +815,23 @@ async fn run_session(
     // Inject platform info into the system prompt so the LLM can adapt its
     // syntax (POSIX vs PowerShell, Unix paths vs Windows paths, etc.).
     let inject = InjectInfo::new(platform);
+
+    // Load project context files (AGENTS.md, etc.) based on config.
+    // Non-fatal: if config loading fails, we just skip context files.
+    let project_context = load_project_context().unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "failed to load project context, skipping");
+        String::new()
+    });
+
+    // Build a cache-aware PromptBuilder. This produces a PromptLayout with
+    // cache breakpoints so Anthropic prompt caching fires on the system
+    // prompt prefix (Static + Project tiers). The flat `system_prompt`
+    // string is still set as a fallback for providers that don't consume
+    // PromptLayout (e.g. OpenAI uses it via `effective_system_prompt()`).
+    let mut prompt_builder = PromptBuilder::new(inject.clone());
+    if !project_context.is_empty() {
+        prompt_builder = prompt_builder.with_project_context(project_context);
+    }
     let system_prompt = inject.system_prompt_fragment();
 
     let config = AgentConfig {
@@ -823,6 +841,7 @@ async fn run_session(
     };
     let mut agent = AgentLoop::new(provider, registry, event_tx.clone(), cancel)
         .with_config(config)
+        .with_prompt_builder(prompt_builder)
         .with_user_edits(user_edits)
         // Wire up auto-compact so long sessions stay within the model's
         // context budget. Default config (128K window, 0.8 trigger ratio).
@@ -846,6 +865,26 @@ async fn run_session(
         loop {
             match event_rx.recv().await {
                 Ok(envelope) => {
+                    // Surface cache hit stats on TurnEnd so the user sees
+                    // cost savings per turn. Printed to stderr so it
+                    // doesn't pollute the transcript on stdout.
+                    if let AgentEvent::TurnEnd { usage, .. } = &envelope.event {
+                        if usage.cached_tokens > 0 || usage.cache_creation_tokens > 0 {
+                            let eff_in = usage.effective_input_tokens();
+                            let pct = (usage.cached_tokens * 100).checked_div(eff_in).unwrap_or(0);
+                            eprintln!(
+                                "  [cache] in={eff_in} cached={} ({pct}%) write={} out={}",
+                                usage.cached_tokens,
+                                usage.cache_creation_tokens,
+                                usage.output_tokens
+                            );
+                        } else {
+                            eprintln!(
+                                "  [usage] in={} out={}",
+                                usage.input_tokens, usage.output_tokens
+                            );
+                        }
+                    }
                     writer.write_event(&envelope).await?;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1310,6 +1349,43 @@ fn load_reviewer_role_config() -> anyhow::Result<lim_config::schema::AgentRoleCo
         .ok_or_else(|| anyhow::anyhow!("reviewer role config not found"))
 }
 
+/// Load project context files (AGENTS.md, etc.) and concatenate them into
+/// a single string ready for `PromptBuilder::with_project_context`.
+///
+/// This uses the `[context]` section of the merged config. When no `[context]`
+/// section exists, falls back to the default (AGENTS.md at workspace root).
+/// When `[context] enabled = false`, returns empty string.
+///
+/// Returns an empty string if config or path detection fails (non-fatal).
+fn load_project_context() -> anyhow::Result<String> {
+    use lim_config::{ConfigLoader, ProjectPaths, XdgPaths, load_context_files};
+
+    let xdg = XdgPaths::detect()?;
+    let project = ProjectPaths::detect()?;
+    let loader = ConfigLoader::new(xdg, project.clone());
+    let loaded = loader.load()?;
+
+    let segments = load_context_files(loaded.workspace.context.as_ref(), &project);
+
+    // Concatenate all segments with clear separators so the LLM can
+    // distinguish multiple project context files.
+    if segments.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut out = String::new();
+    for seg in &segments {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("--- ");
+        out.push_str(&seg.label);
+        out.push_str(" ---\n");
+        out.push_str(&seg.content);
+    }
+    Ok(out)
+}
+
 /// Convert a config-layer `AgentRoleConfig` to a harness-layer `AgentRoleSpec`.
 ///
 /// This is the boundary between `lim-config` (product/config layer) and
@@ -1400,6 +1476,18 @@ async fn build_loop_runner(
     // Clone the registry Arc so it remains available for the reviewer factory
     // (when `--verify reviewer` is used).
     let inject = InjectInfo::new(platform);
+
+    // Load project context files (AGENTS.md, etc.) based on config.
+    // Non-fatal: if config loading fails, we just skip context files.
+    let project_context = load_project_context().unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "failed to load project context, skipping");
+        String::new()
+    });
+
+    let mut prompt_builder = PromptBuilder::new(inject.clone());
+    if !project_context.is_empty() {
+        prompt_builder = prompt_builder.with_project_context(project_context);
+    }
     let agent_config = AgentConfig {
         model,
         system_prompt: Some(inject.system_prompt_fragment()),
@@ -1411,7 +1499,8 @@ async fn build_loop_runner(
         agent_config,
         Some(ContextConfig::default()),
         project_root.join("sessions"),
-    );
+    )
+    .with_prompt_builder(prompt_builder);
 
     // Verifier — four modes:
     //   1. `--verify reviewer`          → ReviewerVerifier (independent reviewer agent)

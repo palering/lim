@@ -324,11 +324,19 @@ impl ResponsesStreamState {
             "response.completed" => {
                 let mut events = Vec::new();
 
-                // Extract usage
+                // Extract usage. Responses API exposes cached input tokens via
+                // `usage.input_tokens_details.cached_tokens` (subset of
+                // `input_tokens`, same semantics as the Chat API's
+                // `prompt_tokens_details`).
                 if let Some(usage) = payload.get("response").and_then(|r| r.get("usage")) {
                     let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    events.push(StreamEvent::Usage(Usage::new(input, output)));
+                    let cached = usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    events.push(StreamEvent::Usage(Usage::with_cache(input, output, cached)));
                 }
 
                 // Determine stop reason

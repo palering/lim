@@ -112,6 +112,10 @@ impl ConfigLoader {
             } else {
                 base.agents
             },
+            // Context config: overlay wins if set. Both `None` → `None`.
+            // This is whole-value replacement (not deep merge of file lists),
+            // which matches the "project overrides global" semantics.
+            context: overlay.context.or(base.context),
         }
     }
 
@@ -204,12 +208,14 @@ mod tests {
             workspace: WorkspaceMode::Shared,
             agents: AgentSource::Project,
             providers: HashMap::new(),
+            context: None,
         };
         let overlay = WorkspaceConfig {
             default_provider: Some("overlay".into()),
             workspace: WorkspaceMode::Worktree,
             agents: AgentSource::Hybrid,
             providers: HashMap::new(),
+            context: None,
         };
         let merged = ConfigLoader::merge(base, overlay);
         assert_eq!(merged.default_provider.as_deref(), Some("overlay"));
@@ -224,6 +230,7 @@ mod tests {
             workspace: WorkspaceMode::Worktree,
             agents: AgentSource::Global,
             providers: HashMap::new(),
+            context: None,
         };
         let overlay = WorkspaceConfig::default();
         let merged = ConfigLoader::merge(base, overlay);

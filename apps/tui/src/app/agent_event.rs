@@ -196,6 +196,9 @@ impl App {
                     self.set_status(format!("⚠ {message}"));
                 }
             }
+            lim_core::event::AgentEvent::SteeringMessageApplied { count, .. } => {
+                self.set_status(format!("↪ {count} steering message(s) applied"));
+            }
         }
     }
 

@@ -20,6 +20,7 @@ use lim_llm::stream::StreamEvent;
 
 use crate::context_window::ContextWindowManager;
 use crate::hooks::{AgentHooks, BeforeToolDecision, SessionEndReason, StopContext, StopDecision};
+use crate::prompt_builder::PromptBuilder;
 use crate::registry::{ToolRegistry, validate_args};
 use crate::stream_accumulator::StreamAccumulator;
 
@@ -112,6 +113,18 @@ pub struct AgentLoop {
     branch_id: BranchId,
     trace_id: TraceId,
     seq: u64,
+    /// Cache-aware prompt builder. When set, produces structured
+    /// [`PromptLayout`] with cache breakpoint annotations for providers
+    /// that support prompt caching. When `None`, falls back to the flat
+    /// `config.system_prompt` string (legacy behavior).
+    prompt_builder: Option<PromptBuilder>,
+    /// Inbound steering channel. When set, the loop drains pending
+    /// [`SteeringMessage`]s at each turn boundary (before `TurnStart`)
+    /// and injects them as User messages into the conversation.
+    ///
+    /// `None` = no steering capability (legacy behavior, fully backward
+    /// compatible). Set via [`Self::with_steering_channel`].
+    steering_rx: Option<tokio::sync::mpsc::UnboundedReceiver<lim_core::SteeringMessage>>,
 }
 
 impl AgentLoop {
@@ -135,6 +148,8 @@ impl AgentLoop {
             branch_id: BranchId::new(),
             trace_id: TraceId::new(),
             seq: 0,
+            prompt_builder: None,
+            steering_rx: None,
         }
     }
 
@@ -147,6 +162,38 @@ impl AgentLoop {
     /// Set agent configuration.
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Set a cache-aware prompt builder.
+    ///
+    /// When set, the agent uses [`PromptBuilder::build`] to produce a
+    /// [`PromptLayout`] with cache breakpoint annotations for each LLM
+    /// request. This enables prompt caching on providers that support it
+    /// (Anthropic `cache_control`).
+    ///
+    /// When not set, falls back to the flat `config.system_prompt` string
+    /// (legacy behavior, no cache control).
+    pub fn with_prompt_builder(mut self, builder: PromptBuilder) -> Self {
+        self.prompt_builder = Some(builder);
+        self
+    }
+
+    /// Attach an inbound steering channel.
+    ///
+    /// When set, the loop drains pending [`SteeringMessage`]s at each turn
+    /// boundary (after the cancel check, before `TurnStart`) and injects
+    /// them as User messages into the conversation. The injection is
+    /// observable via [`AgentEvent::SteeringMessageApplied`].
+    ///
+    /// The caller retains the `UnboundedSender` so the UI/CLI layer can
+    /// enqueue steering messages while the agent is running. Use
+    /// `tokio::sync::mpsc::unbounded_channel()` to create the pair.
+    pub fn with_steering_channel(
+        mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<lim_core::SteeringMessage>,
+    ) -> Self {
+        self.steering_rx = Some(rx);
         self
     }
 
@@ -305,6 +352,52 @@ impl AgentLoop {
         Ok(())
     }
 
+    /// Drain pending steering messages from the inbound channel and inject
+    /// them into the conversation as User messages.
+    ///
+    /// Called at each turn boundary (before `TurnStart`). Non-blocking:
+    /// if the channel is empty or not configured, returns immediately.
+    /// If multiple messages are pending, all are drained and injected in
+    /// arrival order. Emits a single `SteeringMessageApplied` event
+    /// recording the injection for observability.
+    async fn drain_steering_messages(&mut self, messages: &mut Vec<AgentMessage>) -> Result<()> {
+        let Some(rx) = self.steering_rx.as_mut() else {
+            return Ok(());
+        };
+
+        let mut drained: Vec<lim_core::SteeringMessage> = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            drained.push(msg);
+        }
+
+        if drained.is_empty() {
+            return Ok(());
+        }
+
+        let count = drained.len();
+        let mut contents = Vec::with_capacity(count);
+        let mut enqueued_at = Vec::with_capacity(count);
+
+        for msg in drained {
+            debug!(
+                content_len = msg.content.len(),
+                enqueued_at = msg.enqueued_at,
+                "injecting steering message into conversation"
+            );
+            contents.push(msg.content.clone());
+            enqueued_at.push(msg.enqueued_at);
+            // Inject as a User message — the LLM will see it in the next
+            // request and can adjust its behavior accordingly.
+            messages.push(AgentMessage::user(msg.content));
+        }
+
+        info!(count = count, "steering messages applied at turn boundary");
+
+        self.emit(AgentEvent::SteeringMessageApplied { count, contents, enqueued_at })?;
+
+        Ok(())
+    }
+
     /// Run the agent loop with an initial user message.
     ///
     /// Returns all messages generated during the run (including the initial message).
@@ -392,6 +485,13 @@ impl AgentLoop {
                 break;
             }
 
+            // Drain pending steering messages before starting the turn.
+            // This is the P0 "turn boundary" steering: messages queued
+            // while the previous turn was running are injected here, so
+            // the LLM sees them in the next request. Non-blocking — if
+            // the queue is empty, this is a no-op.
+            self.drain_steering_messages(messages).await?;
+
             // Check max_steps hook before starting the turn. When exceeded,
             // end the session with MaxStepsReached so the LoopRunner can
             // decide whether to start a new session.
@@ -448,7 +548,13 @@ impl AgentLoop {
             let mut request = LlmRequest::new(&self.config.model, llm_messages);
             let tool_schemas = self.registry.schemas();
             request = request.with_tools(tool_schemas.clone());
-            if let Some(ref system) = self.config.system_prompt {
+
+            // Build cache-aware prompt layout when a PromptBuilder is set.
+            // Falls back to flat system_prompt string (legacy, no cache control).
+            if let Some(ref builder) = self.prompt_builder {
+                let layout = builder.build();
+                request = request.with_prompt_layout(layout);
+            } else if let Some(ref system) = self.config.system_prompt {
                 request = request.with_system(system.clone());
             }
 
@@ -462,7 +568,7 @@ impl AgentLoop {
                 message_count: request.messages.len(),
                 tool_count: tool_schemas.len(),
                 tool_names: tool_schemas.iter().map(|s| s.name.clone()).collect(),
-                system_prompt_len: request.system.as_ref().map(|s| s.len()),
+                system_prompt_len: request.effective_system_prompt().map(|s| s.len()),
             })?;
             debug!(turn = turn_num, "turn started");
 
@@ -603,10 +709,17 @@ impl AgentLoop {
                 // compaction trigger check uses accurate numbers instead of
                 // the character-count heuristic. See P0 fix in
                 // docs/architecture/compaction.md.
+                //
+                // Use `effective_input_tokens()` to normalize provider
+                // differences: Anthropic's `input_tokens` EXCLUDES cache
+                // reads/writes, so the raw value would over-trigger
+                // compaction. OpenAI's `input_tokens` already includes
+                // cached tokens, so `effective_input_tokens()` returns it
+                // unchanged.
                 if let Some(cwm) = &mut self.context_window {
-                    cwm.observe_usage(usage.input_tokens);
+                    cwm.observe_usage(usage.effective_input_tokens());
                 }
-                cumulative_tokens += usage.input_tokens + usage.output_tokens;
+                cumulative_tokens += usage.effective_input_tokens() + usage.output_tokens;
 
                 // Loop Engineering: ask hooks whether to end this session
                 // before starting the next turn. Default is Continue.
@@ -628,9 +741,9 @@ impl AgentLoop {
                 // No tool calls — turn is complete
                 self.emit(AgentEvent::TurnEnd { turn_id, stop_reason, usage: usage.clone() })?;
                 if let Some(cwm) = &mut self.context_window {
-                    cwm.observe_usage(usage.input_tokens);
+                    cwm.observe_usage(usage.effective_input_tokens());
                 }
-                cumulative_tokens += usage.input_tokens + usage.output_tokens;
+                cumulative_tokens += usage.effective_input_tokens() + usage.output_tokens;
 
                 // Loop Engineering: even on natural stop, give hooks a chance
                 // to record the reason (e.g. GoalReached). Default is Continue,

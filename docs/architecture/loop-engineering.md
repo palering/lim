@@ -610,17 +610,17 @@ lim 的 Loop Engineering 与 Claude Code 的核心差异在于**抽象层级**�
 |---|---|---|---|---|
 | P3.5 | CLI 暴露 LlmVerifier 入口 + 独立 evaluator provider 配置 | Product | 无（harness 已支持） | 高 ✅ 已完成 |
 | P3.5 | 文档：完成契约写进 §一 设计哲学 | 文档 | 无 | 高 ✅ 已完成 |
-| P4 | Skill 系统（`crates/lim-skills/` + `SkillVerifier`） | Harness/Product | Verifier trait | 中 |
-| P4 | Time-based loop（daemon 定时器 + `--every` + cron schedule） | Product | DaemonServer | 中 |
-| P4 | 成本控制细化（Budget `min_interval` + backoff） | Harness | Budget | 低 |
+| P4 | Skill 系统（`crates/lim-skills/` + `SkillVerifier`） | Harness/Product | Verifier trait | 中 ✅ 已完成（P4.7） |
+| P4 | Time-based loop（daemon 定时器 + `--every` + cron schedule） | Product | DaemonServer | 中 ✅ 已完成（P4.8） |
+| P4 | 成本控制细化（Budget `min_interval` + backoff） | Harness | Budget | 低 ✅ 已完成（P4.10） |
 | P2.5 | Reviewer agent 模式（`ReviewerVerifier` + fresh context） | Product | AgentFactory | 中 ✅ 已完成 |
 | P4+ | Proactive routine 组合（schedule + goal + 动态工作流 + auto mode） | Product | 全部上述 | 低 |
 
-**关键结论**：lim 的架构原则（policy in product, mechanism in core）与 CC 的概念完全兼容。CC 的 4 层 loop 在 lim 中不是内置原语，而是通过组合 core trait 实现的 product 形态。P3.5 + P2.5 已完成，剩余差距在 Skill 系统（P4 新 crate）和 Time-based loop（P4 daemon 定时器）。
+**关键结论**：lim 的架构原则（policy in product, mechanism in core）与 CC 的概念完全兼容。CC 的 4 层 loop 在 lim 中不是内置原语，而是通过组合 core trait 实现的 product 形态。P3.5 + P2.5 + P4.7/P4.8/P4.9/P4.10 全部完成，剩余差距在 P4+ Proactive routine 组合（远期）和 P4 增强待定项（cron 库选择、Unix socket 路径、ExponentialBackoff 等产品化细节）。
 
 ## 十三、P1–P3 实现状态与已知问题
 
-> 本节追踪 Loop Engineering P1–P3 的落地情况与已知缺陷，供后续 review/迭代参考。最后更新：2026-07-02。
+> 本节追踪 Loop Engineering P1–P3 的落地情况与已知缺陷，供后续 review/迭代参考。最后更新：2026-07-03。
 
 ### P1（已完成）
 
@@ -665,13 +665,15 @@ lim 的 Loop Engineering 与 Claude Code 的核心差异在于**抽象层级**�
 
 **后续**：P4 增加 Unix socket 传输，`start` 派生 server 进程，其他子命令通过 socket 发送 `DaemonCommand`。
 
-#### 2. daemon `Submit` 不 spawn LoopRunner
+#### 2. daemon `Submit` 不 spawn LoopRunner（部分解决）
 
-`DaemonServer::handle_command(Submit)` 只记录 goal 到 ledger，不构造 `AgentFactory`/`Verifier`/`Budget` 来 spawn `LoopRunner`。实际执行需要用户 `sync` 后到 workspace 跑 `lim loop --resume <ID>`。
+`DaemonServer::handle_command(Submit)` 原本只记录 goal 到 ledger，不构造 `AgentFactory`/`Verifier`/`Budget` 来 spawn `LoopRunner`。实际执行需要用户 `sync` 后到 workspace 跑 `lim loop --resume <ID>`。
 
-**影响**：daemon 模式无法"提交即执行"，目前只是"提交即登记"。
+**当前状态（P4.9 部分解决）**：引入 `GoalRunner` trait（`run_goal()` / `name()`）作为抽象层，`DaemonServer` 可持有 `Arc<dyn GoalRunner>` 并在 `Submit` 时调用。集成测试 `submit_with_goal_runner_updates_status` 验证了 goal 状态流转。但默认实现 `LoggingGoalRunner` 只记录日志，不真正执行 agent —— 真实执行需要 caller 注入一个调用 `LoopRunner` 的 `GoalRunner` 实现。
 
-**后续**：daemon 持有 `AgentFactory` + `Verifier` 工厂，submit 后 spawn 后台 task 跑 `LoopRunner`。
+**影响**：抽象层已就位，daemon 模式可以"提交即执行"（只要注入真实 GoalRunner），但 CLI 默认路径还没接上真实实现。
+
+**后续**：在 CLI `lim loop-daemon start` 路径注入一个 `LoopRunnerGoalRunner`（包装 `AgentFactory` + `Verifier` + `Budget`，spawn 后台 task 跑 `LoopRunner`），替换默认的 `LoggingGoalRunner`。
 
 #### 3. `DaemonAction::Shutdown` 未实现
 
