@@ -8,6 +8,7 @@
 |---|---|---|
 | [basics.md](basics.md) | 日常基础准则（13 条） | 每次 commit 前自检 |
 | [full-guide.md](full-guide.md) | 完整规范（14 节） | 阶段性 review、新模块设计、争议仲裁 |
+| [commits.md](commits.md) | Commit message 规范（Conventional Commits + 双语）| 每次 commit |
 | [../../rustfmt.toml](../../rustfmt.toml) | 代码格式化配置 | `cargo fmt` 自动应用 |
 | [../architecture.md](../architecture.md) | 架构分层与依赖图 | 模块边界决策 |
 
@@ -54,4 +55,5 @@ cargo fmt --check
 
 | 日期 | 变更 | 备注 |
 |---|---|---|
+| 2026-07-03 | 新增 commits.md | Commit message 规范（Conventional Commits + 双语要求）|
 | 2026-06-30 | 初始版本 v1.0 | 建立 basics + full-guide 两层结构，14 节完整规范 |
