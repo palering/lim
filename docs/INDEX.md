@@ -39,6 +39,7 @@ lim/
 ## Files
 
 - [architecture.md](architecture.md) — Confirmed architectural decisions: frontend/library boundary, directory structure, library exportability.
+- [DEVELOPMENT.md](DEVELOPMENT.md) — Standard development workflow guide for AI agents and human contributors.
 - [packaging-plan.md](packaging-plan.md) — Cross-platform packaging & distribution plan (Phase A baseline binaries → Phase B package managers → Phase C self-update).
 
 ### architecture/
