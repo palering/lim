@@ -29,9 +29,34 @@ use lim_core::message::{AgentMessage, LlmMessage, Role, convert_to_llm};
 use lim_llm::provider::{LlmRequest, Provider};
 use lim_llm::stream::StreamEvent;
 
-use crate::compaction::{CompactRequest, CompactionStrategy};
-use crate::context_window::{CompactionResult, ContextConfig};
+use crate::compaction::{
+    CompactRequest, CompactionStrategy, StructuredSummary, extract_file_hints,
+};
+use crate::context_window::{CompactionResult, CompactionTriggerReason, ContextConfig};
 use crate::context_window::{estimate_llm_tokens, estimate_tokens, find_recent_start};
+
+/// Fixed instruction for the structured-summary LLM call.
+///
+/// This text is `const` so it is identical across compactions and gets
+/// included in the prompt cache prefix (alongside the reused system prompt).
+/// Only the dynamic `<conversation>` body varies between calls.
+const SUMMARY_INSTRUCTION: &str = "You are compacting an AI agent's conversation history.\n\
+Output a STRICT JSON object matching this schema. No prose, no markdown fences.\n\n\
+{\n  \
+\"goal\": \"The user's overarching goal for this session (1-2 sentences, or null)\",\n  \
+\"constraints\": [\"Hard constraints: tech stack, conventions, invariants\"],\n  \
+\"done\": [\"Completed work, past tense, time order\"],\n  \
+\"in_progress\": [\"Work currently underway in the most recent turn\"],\n  \
+\"blocked\": [\"Items blocked on external input / failing CI / unresolved errors\"],\n  \
+\"key_decisions\": [\"Why option A was chosen over B, with rationale\"],\n  \
+\"next_steps\": [\"Concrete next actions for the upcoming turn\"],\n  \
+\"critical_context\": [\"Token counts, config values, error stacks, IDs that must survive\"]\n\
+}\n\n\
+Rules:\n\
+- Omit fields you cannot fill (they default to null/empty).\n\
+- Be concrete: \"fixed NPE in auth.rs:142\" not \"fixed a bug\".\n\
+- read_files / modified_files are filled by the runtime, DO NOT output them.\n\
+- Output ONLY the JSON object. No explanation, no code fences.";
 
 /// Default compaction strategy: summarize old messages via an LLM call,
 /// keep recent N conversation pairs verbatim.
@@ -113,6 +138,8 @@ async fn summarize_compact(
             summary_model: String::new(),
             summary_prompt_tokens: 0,
             summary_completion_tokens: 0,
+            summary: None,
+            trigger_reason: CompactionTriggerReason::AutoThreshold,
         });
     }
 
@@ -147,24 +174,49 @@ async fn summarize_compact(
     // Generate summary of old messages (if any non-system messages exist).
     // On failure / empty response, fall back to verbatim old messages
     // (losing context is worse than exceeding the budget).
-    let (summary_text, summary_usage) = if old_text.is_empty() {
-        (String::new(), lim_core::usage::Usage::default())
+    //
+    // Phase 1: try to parse LLM output as a `StructuredSummary`. If it
+    // parses, fill the runtime-only `read_files` / `modified_files` from
+    // local extraction and use `render_for_projection()` as the inserted
+    // message text (cache-stable). If it doesn't parse, fall back to the
+    // raw LLM text as a free-text summary (existing behavior).
+    let file_hints = extract_file_hints(&messages[..recent_start]);
+
+    let (summary_text, structured_summary, summary_usage) = if old_text.is_empty() {
+        (String::new(), None, lim_core::usage::Usage::default())
     } else {
         match summarize(&old_text, Arc::clone(provider), model, system_prompt_text.as_deref(), &[])
             .await
         {
-            Ok((text, usage)) if !text.trim().is_empty() => (text, usage),
+            Ok((raw_text, usage)) if !raw_text.trim().is_empty() => {
+                match StructuredSummary::parse_from_llm_output(&raw_text) {
+                    Some(mut s) if !s.is_llm_output_empty() => {
+                        s.read_files = file_hints.read_files;
+                        s.modified_files = file_hints.modified_files;
+                        let rendered = s.render_for_projection();
+                        (rendered, Some(s), usage)
+                    }
+                    _ => {
+                        warn!(
+                            prompt_tokens = usage.input_tokens,
+                            completion_tokens = usage.output_tokens,
+                            "summary LLM output not parseable as StructuredSummary; using free-text fallback"
+                        );
+                        (raw_text, None, usage)
+                    }
+                }
+            }
             Ok((_, usage)) => {
                 warn!(
                     prompt_tokens = usage.input_tokens,
                     completion_tokens = usage.output_tokens,
                     "summary provider returned empty response; falling back to verbatim old messages"
                 );
-                (String::new(), usage)
+                (String::new(), None, usage)
             }
             Err(e) => {
                 warn!(error = %e, "summary provider failed; falling back to verbatim old messages");
-                (String::new(), lim_core::usage::Usage::default())
+                (String::new(), None, lim_core::usage::Usage::default())
             }
         }
     };
@@ -224,6 +276,8 @@ async fn summarize_compact(
         summary_model: model.to_string(),
         summary_prompt_tokens: summary_usage.input_tokens,
         summary_completion_tokens: summary_usage.output_tokens,
+        summary: structured_summary,
+        trigger_reason: CompactionTriggerReason::AutoThreshold,
     })
 }
 
@@ -289,12 +343,8 @@ async fn summarize(
     // Tool schemas from the main conversation (for cache hit).
     tools: &[lim_core::tool::ToolSchema],
 ) -> Result<(String, lim_core::usage::Usage)> {
-    let summary_prompt = format!(
-        "Summarize the following conversation history concisely. \
-         Preserve: key facts, decisions made, tool outputs, file contents, \
-         and context needed to continue the conversation. \
-         Omit: pleasantries, redundant details.\n\n{conversation_text}"
-    );
+    let summary_prompt =
+        format!("{SUMMARY_INSTRUCTION}\n\n<conversation>\n{conversation_text}\n</conversation>");
 
     let llm_msg = LlmMessage {
         role: Role::User,
@@ -478,5 +528,137 @@ mod tests {
         assert!(result.was_compacted);
         // The override model must be reflected in the result, not the main one.
         assert_eq!(result.summary_model, "gpt-4o-mini");
+    }
+
+    /// Phase 1: when the LLM returns a valid JSON `StructuredSummary`, the
+    /// strategy should parse it, fill `read_files`/`modified_files` from
+    /// local extraction, and use `render_for_projection()` as the inserted
+    /// message text. The `CompactionResult.summary` field should be `Some`.
+    #[tokio::test]
+    async fn summarize_strategy_parses_structured_summary_phase1() {
+        let cwm_config = ContextConfig {
+            context_window: 400,
+            max_output_tokens: 50,
+            compact_buffer_tokens: 0,
+            keep_recent_pairs: 1,
+        };
+        // LLM returns a valid JSON summary.
+        let llm_json = r#"{"goal":"Fix bug in auth","done":["added field","wrote tests"],"next_steps":["run cargo test"]}"#;
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::new(vec![MockResponse::Text(llm_json.to_string())]));
+
+        // Build messages that include tool calls in the old region so
+        // file_hints extraction has something to find.
+        let mut messages = Vec::new();
+        messages.push(AgentMessage::user("old question"));
+        messages.push(AgentMessage::assistant(vec![
+            ContentBlock::text("let me read the file"),
+            ContentBlock::tool_call(
+                ToolCallId::new(),
+                "read",
+                serde_json::json!({"path":"src/main.rs"}),
+            ),
+        ]));
+        messages.push(AgentMessage::assistant(vec![ContentBlock::text("now editing")]));
+        messages.push(AgentMessage::assistant(vec![ContentBlock::tool_call(
+            ToolCallId::new(),
+            "edit",
+            serde_json::json!({"path":"src/lib.rs"}),
+        )]));
+        // Pad to exceed budget.
+        for i in 0..20 {
+            messages.push(AgentMessage::user(format!("q {i}")));
+            messages.push(AgentMessage::assistant(vec![ContentBlock::text(format!("a {i}"))]));
+        }
+        messages.push(AgentMessage::user("latest"));
+        messages.push(AgentMessage::assistant(vec![ContentBlock::text("resp")]));
+
+        let req = CompactRequest {
+            messages: &messages,
+            config: &cwm_config,
+            main_provider: &provider,
+            main_model: "test-model",
+            observed_input_tokens: None,
+        };
+
+        let strategy = SummarizeStrategy::default();
+        let result = strategy.compact(req).await.unwrap();
+
+        assert!(result.was_compacted);
+        let summary = result.summary.expect("Phase 1 should produce a StructuredSummary");
+        assert_eq!(summary.goal, Some("Fix bug in auth".to_string()));
+        assert_eq!(summary.done, vec!["added field".to_string(), "wrote tests".to_string()]);
+        assert_eq!(summary.next_steps, vec!["run cargo test".to_string()]);
+        // Runtime-filled fields from local extraction.
+        assert!(summary.read_files.contains(&"src/main.rs".to_string()));
+        assert!(summary.modified_files.contains(&"src/lib.rs".to_string()));
+
+        // The inserted summary message should use render_for_projection()
+        // (contains the "[Earlier conversation summary]" marker).
+        let summary_msg = result
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == Role::User
+                    && m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("[Earlier conversation summary]")))
+            })
+            .expect("should find a summary message");
+        let text = summary_msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("Goal: Fix bug in auth"));
+        assert!(text.contains("Files Read:"));
+        assert!(text.contains("src/main.rs"));
+        assert!(text.contains("Files Modified:"));
+        assert!(text.contains("src/lib.rs"));
+    }
+
+    /// Phase 1: when the LLM returns unparseable prose (not JSON), the
+    /// strategy should fall back to using the raw text as the summary
+    /// message and `CompactionResult.summary` should be `None`.
+    #[tokio::test]
+    async fn summarize_strategy_falls_back_to_free_text_when_unparseable() {
+        let cwm_config = ContextConfig {
+            context_window: 400,
+            max_output_tokens: 50,
+            compact_buffer_tokens: 0,
+            keep_recent_pairs: 1,
+        };
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![MockResponse::Text(
+            "Just plain prose summary, no JSON here.".to_string(),
+        )]));
+
+        let mut messages = Vec::new();
+        for i in 0..20 {
+            messages.push(AgentMessage::user(format!("q {i}")));
+            messages.push(AgentMessage::assistant(vec![ContentBlock::text(format!("a {i}"))]));
+        }
+        messages.push(AgentMessage::user("latest"));
+        messages.push(AgentMessage::assistant(vec![ContentBlock::text("resp")]));
+
+        let req = CompactRequest {
+            messages: &messages,
+            config: &cwm_config,
+            main_provider: &provider,
+            main_model: "test-model",
+            observed_input_tokens: None,
+        };
+
+        let strategy = SummarizeStrategy::default();
+        let result = strategy.compact(req).await.unwrap();
+
+        assert!(result.was_compacted);
+        assert!(result.summary.is_none(), "free-text fallback should set summary to None");
+        // The raw prose should still appear as the summary message.
+        let has_summary_msg = result.messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Just plain prose")))
+        });
+        assert!(has_summary_msg, "free-text summary should be inserted as a User message");
     }
 }

@@ -117,12 +117,26 @@ pub struct CompactRequest<'a> {
 工作流程：
 1. `find_recent_start(messages, keep_recent_pairs)` — 找到需要保留的最近 N 对 user/assistant 消息的起始索引
 2. 把 `messages[..recent_start]` 转成纯文本（`message_to_text`）
-3. 用 main_provider（或 `with_provider`/`with_model` 覆盖的更便宜模型）调用 LLM 生成摘要
-4. 返回 `[summary_message, *recent_messages]` 作为 `LlmMessage` 列表
+3. `extract_file_hints(&messages[..recent_start])` — 本地确定性提取 `read`/`write`/`edit` 工具调用的文件路径（Phase 1）
+4. 用 main_provider（或 `with_provider`/`with_model` 覆盖的更便宜模型）调用 LLM 生成摘要，prompt 用 cache-safe `const SUMMARY_INSTRUCTION`（JSON schema 指令）
+5. `StructuredSummary::parse_from_llm_output(raw_text)` — 三级 fallback 解析 LLM 输出（直接 parse → ```json``` 代码块 → 大括号匹配）
+6. 解析成功：填充 `read_files`/`modified_files`（来自 step 3），用 `render_for_projection()` 作为插入消息文本，`CompactionResult.summary = Some(s)`
+7. 解析失败：fallback 到自由文本摘要（保留 pre-Phase 1 行为），`CompactionResult.summary = None`
+8. 返回 `[summary_message, *recent_messages]` 作为 `LlmMessage` 列表
+
+**StructuredSummary 字段（Phase 1）**：
+
+- LLM 填充（9 个）：`goal` / `constraints` / `done` / `in_progress` / `blocked` / `key_decisions` / `next_steps` / `critical_context`（+ `turn_prefix_summary` 留给 Phase 2）
+- 运行时填充（2 个）：`read_files` / `modified_files`（由 `extract_file_hints()` 本地提取，不依赖 LLM）
 
 **扩展点**：
 - `SummarizeStrategy::with_provider(provider)` — 用不同的 provider 做摘要（如 OpenAI 摘要 Claude 对话）
 - `SummarizeStrategy::with_model(model)` — 用更便宜的模型做摘要（如 `gpt-4o-mini`）
+
+**Phase 2 待实现**：
+- `OverflowRecovery` trigger（provider 返回 context_length_exceeded 后的恢复压缩）
+- `turn_prefix_summary` 处理 split turn（压缩发生在 tool_call → tool_result 之间时）
+- `trigger_reason` 字段提升到 `ContextCompacted` event（需要将 `CompactionTriggerReason` 移到 lim-core 或用 String 透传）
 
 ### 2.4 ContextWindowManager
 
