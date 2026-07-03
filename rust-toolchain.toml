@@ -1,5 +1,0 @@
-[toolchain]
-# Pinned to ensure local and CI use the same toolchain.
-# Bump intentionally after verifying clippy compatibility.
-channel = "1.96.0"
-components = ["clippy", "rustfmt"]
