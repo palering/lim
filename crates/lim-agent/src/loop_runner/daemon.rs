@@ -36,7 +36,6 @@ use tracing::{debug, info, warn};
 use lim_core::error::{LimError, Result};
 use lim_core::id::GoalId;
 
-use super::ipc::IpcTransport;
 use super::ledger::{DaemonLedger, LedgerBackend};
 use super::runner::GoalResult;
 use super::state::{GoalStatus, LoopState};
@@ -337,6 +336,7 @@ fn format_status(status: &GoalStatus) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ipc::IpcTransport;
     use super::*;
     use camino::Utf8PathBuf;
 
@@ -565,11 +565,11 @@ mod tests {
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let resp = handle.send(DaemonCommand::Status { goal_id }).await.unwrap();
-            if let DaemonResponse::Status { state, .. } = resp {
-                if !matches!(state.status, GoalStatus::Running) {
-                    final_status = Some(state.status);
-                    break;
-                }
+            if let DaemonResponse::Status { state, .. } = resp
+                && !matches!(state.status, GoalStatus::Running)
+            {
+                final_status = Some(state.status);
+                break;
             }
         }
         let final_status =
