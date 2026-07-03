@@ -17,6 +17,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/palering/lim"
 
