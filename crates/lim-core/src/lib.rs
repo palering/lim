@@ -16,7 +16,9 @@ pub mod id;
 pub mod inject;
 pub mod loop_end;
 pub mod message;
+pub mod prompt;
 pub mod status;
+pub mod steering;
 pub mod stop_reason;
 pub mod tool;
 pub mod usage;
@@ -32,7 +34,9 @@ pub use id::{ArtifactId, BranchId, GoalId, MessageId, SessionId, ToolCallId, Tra
 pub use inject::InjectInfo;
 pub use loop_end::SessionEndReason;
 pub use message::{AgentMessage, LlmMessage, Role, TurnResult, convert_to_llm};
+pub use prompt::{CacheTier, PromptLayout, PromptLayoutBuilder, PromptSegment};
 pub use status::{ComponentStatus, Condition, ConditionStatus, StatusProvider};
+pub use steering::SteeringMessage;
 pub use stop_reason::StopReason;
 pub use tool::{ToolCall, ToolResult, ToolSchema};
 pub use usage::Usage;
@@ -53,11 +57,21 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// lim version that wrote the current binary (compile-time constant).
 ///
-/// Recorded in `SessionHeader` events for debug/audit. This is the
-/// `lim-core` crate version, which tracks the lim CLI version in
-/// practice. If the crates diverge in the future, switch this to a
-/// workspace-shared constant.
-pub const LIM_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Recorded in `SessionHeader` events for debug/audit. Prefer the
+/// build-time git description (`LIM_BUILD_VERSION`, set by
+/// `build.rs` via `git describe --tags --always --dirty=-dirty`) so
+/// that `lim --version` and session JSONL report the actual release
+/// tag + commit, not just the static `CARGO_PKG_VERSION`. Falls back
+/// to `CARGO_PKG_VERSION` when git is unavailable (e.g. tarball build
+/// without `.git`).
+///
+/// Consumers:
+///   - `SessionHeader.lim_version` in session JSONL
+///   - clap `#[command(version = LIM_VERSION)]` in the CLI
+pub const LIM_VERSION: &str = match option_env!("LIM_BUILD_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 
 /// Compact platform identifier for `SessionHeader`, e.g. `"macos/aarch64"`.
 ///

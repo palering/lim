@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 use lim_core::content::ContentBlock;
 use lim_core::error::{LimError, Result};
 use lim_core::event::EventEnvelope;
-use lim_core::id::GoalId;
+use lim_core::id::{GoalId, SessionId};
 use lim_core::message::{AgentMessage, LlmMessage, Role};
 
 use lim_llm::provider::{LlmRequest, Provider};
@@ -48,6 +48,71 @@ pub enum VerifyResult {
     NeedsHuman,
 }
 
+/// Metadata returned by a verifier alongside the [`VerifyResult`].
+///
+/// Closes the §8.4 black-box: `LoopEvent::VerificationDone` previously
+/// hardcoded `verifier_session_id: None` and `verifier_tokens_used: None`
+/// because the `Verifier` trait had no way to surface this metadata. Now
+/// each verifier can report:
+///
+/// - `session_id`: the [`SessionId`] of the verifier's own agent run
+///   (e.g. the reviewer agent's session). `None` for verifiers that don't
+///   run an agent (e.g. `CommandVerifier`, `LlmVerifier`).
+/// - `tokens_used`: total tokens consumed by the verifier's LLM call(s).
+///   `None` when not applicable (e.g. `CommandVerifier`).
+///
+/// Both fields are optional because different verifier kinds have
+/// different capabilities. `LoopRunner` propagates them into
+/// `LoopEvent::VerificationDone` for observability.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VerifyMetadata {
+    /// The verifier agent's session ID, when the verifier runs a full
+    /// `AgentLoop` (e.g. `ReviewerVerifier`). `None` for non-agent verifiers.
+    pub session_id: Option<SessionId>,
+    /// Total tokens consumed by the verifier's LLM call(s), when applicable.
+    /// `None` for non-LLM verifiers (e.g. `CommandVerifier`).
+    pub tokens_used: Option<u64>,
+}
+
+impl VerifyMetadata {
+    /// Empty metadata (no session, no tokens). Used by verifiers that
+    /// don't run an agent or LLM (e.g. `CommandVerifier`, `AlwaysPassVerifier`).
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// The outcome of a verification: the result plus metadata.
+///
+/// Returned by `Verifier::verify()`. The `result` drives the Goal Loop's
+/// control flow; the `metadata` is propagated into `LoopEvent::VerificationDone`
+/// for observability (closing the §8.4 black-box).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyOutcome {
+    pub result: VerifyResult,
+    #[serde(default)]
+    pub metadata: VerifyMetadata,
+}
+
+impl VerifyOutcome {
+    /// Build an outcome with no metadata (convenience for verifiers that
+    /// don't produce session/token metadata).
+    pub fn plain(result: VerifyResult) -> Self {
+        Self { result, metadata: VerifyMetadata::none() }
+    }
+
+    /// Build an outcome with the given metadata.
+    pub fn with(result: VerifyResult, metadata: VerifyMetadata) -> Self {
+        Self { result, metadata }
+    }
+}
+
+impl From<VerifyResult> for VerifyOutcome {
+    fn from(result: VerifyResult) -> Self {
+        Self::plain(result)
+    }
+}
+
 /// Context passed to `Verifier::verify()` alongside the loop state.
 ///
 /// Carries the `goal_id` (for correlation with `.lim/loop/<goal_id>/`) and
@@ -70,10 +135,13 @@ pub struct VerifyContext<'a> {
 pub trait Verifier: Send + Sync {
     /// Verify whether the goal has been achieved given the current state.
     ///
+    /// Returns a [`VerifyOutcome`] containing the result plus metadata
+    /// (session ID and tokens used by the verifier, for observability).
+    ///
     /// `ctx` carries the `goal_id` and `loop_dir` so verifiers (e.g.
     /// `ReviewerVerifier`) can persist their own event logs. Simple verifiers
     /// (e.g. `CommandVerifier`) can ignore `ctx`.
-    async fn verify(&self, state: &LoopState, ctx: &VerifyContext<'_>) -> Result<VerifyResult>;
+    async fn verify(&self, state: &LoopState, ctx: &VerifyContext<'_>) -> Result<VerifyOutcome>;
 
     /// Identifier for this verifier kind (e.g. "command", "llm", "reviewer").
     ///
@@ -105,7 +173,7 @@ impl Verifier for CommandVerifier {
         "command"
     }
 
-    async fn verify(&self, _state: &LoopState, _ctx: &VerifyContext<'_>) -> Result<VerifyResult> {
+    async fn verify(&self, _state: &LoopState, _ctx: &VerifyContext<'_>) -> Result<VerifyOutcome> {
         // Parse the command into program + args (simple split on spaces;
         // sufficient for typical verifier commands like "cargo test").
         let parts: Vec<&str> = self.command.split_whitespace().collect();
@@ -133,7 +201,7 @@ impl Verifier for CommandVerifier {
 
         if output.status.success() {
             info!(command = %self.command, "verifier: PASS");
-            Ok(VerifyResult::Pass)
+            Ok(VerifyOutcome::plain(VerifyResult::Pass))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -143,7 +211,7 @@ impl Verifier for CommandVerifier {
                 format!("exit code {:?}\n{}", output.status.code(), stderr.trim())
             };
             warn!(command = %self.command, reason = %reason, "verifier: FAIL");
-            Ok(VerifyResult::Fail(reason))
+            Ok(VerifyOutcome::plain(VerifyResult::Fail(reason)))
         }
     }
 }
@@ -159,8 +227,8 @@ impl Verifier for AlwaysPassVerifier {
         "always_pass"
     }
 
-    async fn verify(&self, _state: &LoopState, _ctx: &VerifyContext<'_>) -> Result<VerifyResult> {
-        Ok(VerifyResult::Pass)
+    async fn verify(&self, _state: &LoopState, _ctx: &VerifyContext<'_>) -> Result<VerifyOutcome> {
+        Ok(VerifyOutcome::plain(VerifyResult::Pass))
     }
 }
 
@@ -223,7 +291,7 @@ impl Verifier for LlmVerifier {
         "llm"
     }
 
-    async fn verify(&self, state: &LoopState, _ctx: &VerifyContext<'_>) -> Result<VerifyResult> {
+    async fn verify(&self, state: &LoopState, _ctx: &VerifyContext<'_>) -> Result<VerifyOutcome> {
         let prompt = self.build_prompt(state);
         let request = LlmRequest::new(
             &self.model,
@@ -236,10 +304,17 @@ impl Verifier for LlmVerifier {
         .with_max_tokens(256);
 
         let mut text = String::new();
+        // Track the last Usage seen in the stream. Providers typically emit
+        // a single Usage event at the end of the stream; we take the last
+        // one (it carries the cumulative totals).
+        let mut tokens_used: Option<u64> = None;
         let mut stream = self.provider.stream(request);
         while let Some(event) = stream.next().await {
             match event {
                 Ok(StreamEvent::TextDelta { text: delta }) => text.push_str(&delta),
+                Ok(StreamEvent::Usage(usage)) => {
+                    tokens_used = Some(usage.total_tokens);
+                }
                 Ok(_) => {}
                 Err(e) => {
                     warn!(error = %e, "llm verifier stream error");
@@ -254,21 +329,22 @@ impl Verifier for LlmVerifier {
 
         let first_line = text.lines().next().unwrap_or("").trim().to_string();
         debug!(response = %text, first_line = %first_line, "llm verifier response");
-        if first_line.starts_with("PASS") {
+        let result = if first_line.starts_with("PASS") {
             info!("llm verifier: PASS");
-            Ok(VerifyResult::Pass)
+            VerifyResult::Pass
         } else if let Some(reason) = first_line.strip_prefix("FAIL:") {
             let reason = reason.trim().to_string();
             warn!(reason = %reason, "llm verifier: FAIL");
-            Ok(VerifyResult::Fail(reason))
+            VerifyResult::Fail(reason)
         } else if first_line.starts_with("NEEDS_HUMAN") {
             warn!("llm verifier: NEEDS_HUMAN");
-            Ok(VerifyResult::NeedsHuman)
+            VerifyResult::NeedsHuman
         } else {
             // Unparseable response — treat as NeedsHuman to avoid silent loops.
             warn!(first_line = %first_line, "llm verifier: unparseable response");
-            Ok(VerifyResult::NeedsHuman)
-        }
+            VerifyResult::NeedsHuman
+        };
+        Ok(VerifyOutcome::with(result, VerifyMetadata { session_id: None, tokens_used }))
     }
 }
 
@@ -300,14 +376,35 @@ impl Verifier for AllPassVerifier {
         "all_pass"
     }
 
-    async fn verify(&self, state: &LoopState, ctx: &VerifyContext<'_>) -> Result<VerifyResult> {
+    async fn verify(&self, state: &LoopState, ctx: &VerifyContext<'_>) -> Result<VerifyOutcome> {
         let mut last_fail: Option<String> = None;
+        // Aggregate metadata across all sub-verifiers: keep the first
+        // non-None session_id and sum all token counts. This preserves
+        // observability when combining e.g. a CommandVerifier (no metadata)
+        // and a ReviewerVerifier (session_id + tokens).
+        let mut merged_session_id: Option<SessionId> = None;
+        let mut merged_tokens: u64 = 0;
+        let mut saw_tokens = false;
         for v in &self.verifiers {
-            match v.verify(state, ctx).await? {
+            let outcome = v.verify(state, ctx).await?;
+            if merged_session_id.is_none() {
+                merged_session_id = outcome.metadata.session_id;
+            }
+            if let Some(t) = outcome.metadata.tokens_used {
+                merged_tokens += t;
+                saw_tokens = true;
+            }
+            match outcome.result {
                 VerifyResult::Pass => continue,
                 VerifyResult::NeedsHuman => {
                     // NeedsHuman takes priority — escalate immediately.
-                    return Ok(VerifyResult::NeedsHuman);
+                    return Ok(VerifyOutcome::with(
+                        VerifyResult::NeedsHuman,
+                        VerifyMetadata {
+                            session_id: merged_session_id,
+                            tokens_used: if saw_tokens { Some(merged_tokens) } else { None },
+                        },
+                    ));
                 }
                 VerifyResult::Fail(reason) => {
                     if last_fail.is_none() {
@@ -316,10 +413,17 @@ impl Verifier for AllPassVerifier {
                 }
             }
         }
-        match last_fail {
-            Some(reason) => Ok(VerifyResult::Fail(reason)),
-            None => Ok(VerifyResult::Pass),
-        }
+        let result = match last_fail {
+            Some(reason) => VerifyResult::Fail(reason),
+            None => VerifyResult::Pass,
+        };
+        Ok(VerifyOutcome::with(
+            result,
+            VerifyMetadata {
+                session_id: merged_session_id,
+                tokens_used: if saw_tokens { Some(merged_tokens) } else { None },
+            },
+        ))
     }
 }
 
@@ -532,7 +636,7 @@ impl Verifier for ReviewerVerifier {
         "reviewer"
     }
 
-    async fn verify(&self, state: &LoopState, ctx: &VerifyContext<'_>) -> Result<VerifyResult> {
+    async fn verify(&self, state: &LoopState, ctx: &VerifyContext<'_>) -> Result<VerifyOutcome> {
         let prompt = self.build_prompt(state);
         debug!(
             goal = %state.goal,
@@ -543,6 +647,7 @@ impl Verifier for ReviewerVerifier {
         // Spawn a fresh reviewer agent with its own context window.
         // The agent has no memory of the main agent's work (fresh context).
         let (mut reviewer, event_rx) = self.factory.create_session();
+        let session_id = reviewer.session_id();
         let user_msg = AgentMessage::user(prompt);
 
         // Persist reviewer AgentEvents to `<loop_dir>/<goal_id>/reviews/review-<N>.jsonl`.
@@ -588,24 +693,37 @@ impl Verifier for ReviewerVerifier {
         debug!(
             first_line = %first_line,
             response_len = final_text.len(),
+            session_id = %session_id,
             "reviewer agent responded"
         );
 
-        if first_line.starts_with("PASS") {
+        let result = if first_line.starts_with("PASS") {
             info!("reviewer verifier: PASS");
-            Ok(VerifyResult::Pass)
+            VerifyResult::Pass
         } else if let Some(reason) = first_line.strip_prefix("FAIL:") {
             let reason = reason.trim().to_string();
             warn!(reason = %reason, "reviewer verifier: FAIL");
-            Ok(VerifyResult::Fail(reason))
+            VerifyResult::Fail(reason)
         } else if first_line.starts_with("NEEDS_HUMAN") {
             warn!("reviewer verifier: NEEDS_HUMAN");
-            Ok(VerifyResult::NeedsHuman)
+            VerifyResult::NeedsHuman
         } else {
             // Unparseable response — treat as NeedsHuman to avoid silent loops.
             warn!(first_line = %first_line, "reviewer verifier: unparseable response");
-            Ok(VerifyResult::NeedsHuman)
-        }
+            VerifyResult::NeedsHuman
+        };
+
+        // The reviewer agent's token usage is recorded in its session
+        // JSONL (via the SessionEventPersister / ReviewPersister). We don't
+        // aggregate it here because the events flow through a separate
+        // channel that has already been drained and closed by the time we
+        // reach this point. `tokens_used` is left as None for now — a
+        // future enhancement could capture it by tapping the event stream
+        // before handing it to the persister.
+        Ok(VerifyOutcome::with(
+            result,
+            VerifyMetadata { session_id: Some(session_id), tokens_used: None },
+        ))
     }
 }
 
@@ -704,7 +822,7 @@ impl Verifier for SkillVerifier {
         }
     }
 
-    async fn verify(&self, state: &LoopState, ctx: &VerifyContext<'_>) -> Result<VerifyResult> {
+    async fn verify(&self, state: &LoopState, ctx: &VerifyContext<'_>) -> Result<VerifyOutcome> {
         match &self.inner {
             SkillVerifierInner::Command(v) => v.verify(state, ctx).await,
             SkillVerifierInner::Llm(v) => v.verify(state, ctx).await,
@@ -718,10 +836,12 @@ mod tests {
     use lim_llm::mock::{MockProvider, MockResponse};
 
     /// Helper: verify with a throwaway context (no loop_dir, so no persistence).
+    /// Returns only the `VerifyResult` (drops metadata) for concise assertions.
     async fn verify_no_ctx<V: Verifier + ?Sized>(v: &V, state: &LoopState) -> Result<VerifyResult> {
         let goal_id = GoalId::new();
         let ctx = VerifyContext { goal_id: &goal_id, loop_dir: None };
-        v.verify(state, &ctx).await
+        let outcome = v.verify(state, &ctx).await?;
+        Ok(outcome.result)
     }
 
     #[tokio::test]
@@ -812,8 +932,8 @@ mod tests {
                 &self,
                 _state: &LoopState,
                 _ctx: &VerifyContext<'_>,
-            ) -> Result<VerifyResult> {
-                Ok(VerifyResult::NeedsHuman)
+            ) -> Result<VerifyOutcome> {
+                Ok(VerifyOutcome::plain(VerifyResult::NeedsHuman))
             }
         }
         let v = AllPassVerifier::new(vec![
@@ -895,8 +1015,8 @@ mod tests {
         let goal_id = GoalId::new();
         let ctx = VerifyContext { goal_id: &goal_id, loop_dir: Some(&loop_dir) };
 
-        let result = v.verify(&state, &ctx).await.unwrap();
-        assert!(matches!(result, VerifyResult::Pass));
+        let outcome = v.verify(&state, &ctx).await.unwrap();
+        assert!(matches!(outcome.result, VerifyResult::Pass));
 
         // The review file should exist at <loop_dir>/<goal_id>/reviews/review-1.jsonl
         let review_path = loop_dir.join(goal_id.to_string()).join("reviews").join("review-1.jsonl");
@@ -905,6 +1025,12 @@ mod tests {
         // The file should contain at least one JSONL line (an AgentEvent).
         let content = std::fs::read_to_string(review_path.as_std_path()).unwrap();
         assert!(!content.is_empty(), "review file should not be empty");
+
+        // B-2: ReviewerVerifier should report its session_id in metadata.
+        assert!(
+            outcome.metadata.session_id.is_some(),
+            "reviewer verifier must report session_id in metadata"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

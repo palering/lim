@@ -1,10 +1,15 @@
 # lim — Implementation Progress
 
-> Last updated: 2026-06-30
-> Workspace: 10 crates, 262 tests, 0 clippy warnings
-> Details: [docs/archive/completed-phases.md](docs/archive/completed-phases.md)
+> Last updated: 2026-07-03
+> Workspace: 12 crates, 432 tests, 0 clippy warnings
+> Roadmap: [docs/architecture/evolution.md](docs/architecture/evolution.md)
+> Behavior trace: [docs/architecture/behavior-trace.md](docs/architecture/behavior-trace.md)
 
-## Completed
+## Current Phase
+
+**P4 完成** — 阶段 4（Loop Engineering 完整 + CC Time-based loop + 多 agent workspace）全部落地。P0-P4.11 全部 ✅，P3.5 ✅。下一步是 v0.1 release 前的历史压缩（见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)）和 packaging 收尾（见 [docs/packaging-plan.md](docs/packaging-plan.md)）。
+
+## Completed Phases
 
 ### Phase 1: Minimal Agent Runtime — DONE
 
@@ -28,11 +33,11 @@ Commits `798a460`, `fae6317`. All review items resolved:
 
 ### ContextWindowManager — DONE
 
-Commit `52039a1` | +20 tests (lim-agent: 8→28). Token estimation, compaction algorithm, summary via provider, AgentLoop integration with ContextCompacted event.
+Commit `52039a1` | Token estimation, compaction algorithm, summary via provider, AgentLoop integration with ContextCompacted event.
 
 ### ContextEdit — 3-Layer Context Projection — DONE
 
-Commit `6064e6c` | +11 tests (lim-core: 19→30). Universal `ContextEdit` descriptor (`exclude` + `replace`), pure `apply_edit()` / `compose_edits()` functions, `AgentEvent::ContextEdited` variant, `AgentHooks::edit_context()` extension. AgentLoop integrates the 3-layer pipeline: loop edit (hooks, transient) → user edit (persistent, JSONL) → compact (CWM, token budget).
+Commit `6064e6c` | Universal `ContextEdit` descriptor (`exclude` + `replace`), pure `apply_edit()` / `compose_edits()` functions, `AgentEvent::ContextEdited` variant, `AgentHooks::edit_context()` extension. AgentLoop integrates the 3-layer pipeline: loop edit (hooks, transient) → user edit (persistent, JSONL) → compact (CWM, token budget).
 
 ### LLM Provider Stack — DONE (Phase 3a)
 
@@ -46,7 +51,6 @@ Commit `6064e6c` | +11 tests (lim-core: 19→30). Universal `ContextEdit` descri
 
 - Endpoint resolution priority: `full_url` (verbatim) > `base_url + suffix` > `type default + suffix`
 - `base_url` is host-only (e.g. `https://api.openai.com`); `/v1` is part of the protocol suffix
-- Startup warning when `base_url` ends with `/v1`
 - API key via `api_key` (plaintext, dev) or `api_key_env` (env var, production)
 - Model alias resolution: CLI `--model` > provider `default_model`
 
@@ -58,7 +62,11 @@ Commit `6064e6c` | +11 tests (lim-core: 19→30). Universal `ContextEdit` descri
 - `lim run --resume <session.jsonl>` — multi-turn resume with edit replay
 - `lim providers` — list configured providers
 - `lim tui` — launch terminal UI
-- Reads `.lim/config.toml` (gitignored)
+- `lim sessions [--details <path>]` — list/inspect saved sessions
+- `lim edit-context --session <jsonl> [--exclude 1,3,5] [--replace 2:...] [--list]`
+- `lim loop --goal "..." --verify "<cmd>"` — Loop Engineering
+- `lim loop-daemon <action>` — daemon mode
+- Reads `.lim/config.toml` (gitignored) + global `~/.config/lim/config.toml` (XDG)
 
 ### TUI MVP — DONE (Phase 3a)
 
@@ -69,139 +77,101 @@ Commit `6064e6c` | +11 tests (lim-core: 19→30). Universal `ContextEdit` descri
 - Runtime model/provider switching via `AgentCommand::{SetModel, SetProvider}`
 - Agent runs in background tokio task; TUI subscribes via `broadcast::Sender<EventEnvelope>`
 - Tool call display with expand/collapse
-- Tool approval popup
-
-### Bug Fixes (2026-06-28) — DONE
-
-Critical fixes verified against real LLM endpoints:
-
-1. **ToolCallId preservation** — OpenAI Chat and Responses providers now preserve provider-supplied ids (`call_*`, `toolu_*`) via `ToolCallId::from_string()` instead of generating new Ulids. Without this, multi-turn tool call conversations broke because providers couldn't correlate `tool_result` messages with the original tool calls.
-2. **ContextEdited replay chain** — `run_continue` now re-emits all `ContextEdited` events into the new session JSONL. Without this, chained resumes (A → B → C) would lose A's edits in C.
-3. **SessionWriter truncate** — `SessionWriter::create()` switched from `append` to `truncate` mode. Reusing an output path no longer pollutes the new session with stale events from a previous run.
-4. **SSE error detection** — `http::try_extract_error()` detects provider/proxy errors embedded as SSE events (Anthropic `event: error`, OpenAI Responses `error` event, generic proxy `{"error":{...}}`) and surfaces them as `ProviderError::Api` instead of silently dropping them as empty responses.
-
-### End-to-End Verification — DONE (2026-06-28)
-
-9 test cases across 3 providers × 3 scenarios:
-
-| Scenario | openai-chat (grok) | openai-responses (grok) | anthropic (deepseek-v4-flash) |
-| :--- | :--- | :--- | :--- |
-| 1. Basic conversation | ✅ | ✅ | ✅ |
-| 2. read tool call | ❌ model refuses tool calls | ❌ model refuses tool calls | ✅ |
-| 3. bash pwd | ❌ model fabricates answer | ❌ model fabricates answer | ✅ |
-
-- All 9 runs produce well-formed JSONL event streams with correct `MessageEnd` / `TurnEnd` / `AgentEnd` sequences
-- Replay verification passes for all sessions
-- The 4 grok failures are model-capability issues, not lim bugs (verified: same `tool` schema works on anthropic-type)
-- 188 unit tests + 9 e2e runs cover the implementation
+- Tool approval popup (Auto/Smart/Always modes)
+- Context editing via `/edit list|exclude|replace|clear`
+- Cost panel: cumulative tokens, last-turn tokens, context window usage, compaction cost
 
 ### Phase 3b: UX Hardening — DONE
 
-4 work streams closing out Phase 3. +10 tests (188→198), 0 clippy warnings.
-
-**Approval (真阻塞) — `apps/tui/src/approval.rs`**
-
-- `ApprovalMode::{Auto, Smart, Always}` shared via `Arc<Mutex<ApprovalMode>>` between `ApprovalHooks` and `App`
-- `ApprovalRequest` carries a `oneshot::Sender<ApprovalResponse>`; `ApprovalHooks::before_tool_call` blocks on `rx.await` until TUI responds
-- Smart mode auto-approves read-only tools, prompts for write/exec
-- 11 unit tests cover auto/smart/always modes, deny, closed channel, idempotent respond
-- `run_continue` re-emits `ContextEdited` events so chained resumes preserve edit history
-
-**Cost / Usage Panel — `apps/tui/src/ui/status.rs`**
-
-- Status bar expanded to 2 rows
-- Line 1: busy indicator · turn count · approval mode · status message
-- Line 2: cumulative tokens · last turn tokens · context window usage (`msgs→msgs (tok→tok)` shown only after first compaction)
-- `ContextWindowUsage` cached on `App` from `AgentEvent::ContextCompacted`
-
-**Context Editing — CLI + TUI**
-
-- `lim edit-context --session <jsonl> [--exclude 1,3,5] [--replace 2:...] [--list]` appends a `ContextEdited` event to the JSONL (uses `OpenOptions::append(true)`, not `SessionWriter` which truncates)
-- TUI `/edit list|exclude|replace|clear` sends `AgentCommand::{ApplyEdit, ClearEdits}` to the agent task
-- `AgentLoop::apply_user_edit` / `clear_user_edits` emit `ContextEdited` events for persistence
-- `clear_user_edits` is a no-op when the edit list is empty (no event emitted)
-- 3 unit tests cover apply / clear-emits-empty / clear-noop-when-empty
-
-**Error Recovery — `crates/lim-agent/src/agent_loop.rs`**
-
-- `AgentEvent::Error { message, retryable, retry_count, max_retries }` variant added
-- Retry loop: only retry when no content has been emitted yet (avoids duplicate/partial messages)
-- Exponential backoff: 1s → 2s → 4s, `MAX_RETRIES = 3`
-- Cancellation-aware sleep via `tokio::select!`
-- `StreamAccumulator::reset()` clears content but preserves `message_id` for stable TUI rendering
-- `MockResponse::Error(ProviderError)` supports deterministic retry tests; `ProviderError` now derives `Clone`
-- 3 unit tests cover retry-success / no-retry-on-auth / retry-exhaustion (use `#[tokio::test(start_paused = true)]` for instant backoff)
-- TUI shows `⚠ <msg>  (retry N/M)` during retries, `⚠ <msg>  (retries exhausted: N/M)` on final failure
+4 work streams: Approval (Auto/Smart/Always), Cost/Usage Panel, Context Editing (CLI + TUI), Error Recovery (exponential backoff retry).
 
 ### Phase 3c: Behavior Observability + Platform Abstraction — DONE
 
-Two work streams hardening lim against black-box behavior.
-
-**Behavior Trace & Observability — `docs/architecture/behavior-trace.md`**
-
-- 6 design principles established (Behavior Traceable / Implicit Made Explicit / No Silent Failure / Layered Observability / Closed Enum / Lock-Free Across Await)
-- All silent-failure paths in 3 providers' SSE parsers + StreamAccumulator now emit `warn!` instead of silently dropping events
-- Implicit behaviors made explicit: `ToolRegistry::schemas()` now sorted by name (was HashMap order); `ApprovalHooks::Reject` and schema validation failures now emit `ToolExecutionStart` + `ToolExecutionEnd` (were silent returns)
-- `AgentEvent::TurnStart` extended with `model` / `message_count` / `tool_count` / `tool_names` / `system_prompt_len` for self-auditing
-- `AgentEvent::ToolExecutionStart` / `ToolExecutionEnd` now carry Unix ms timestamps (`started_at` / `ended_at`)
-- 3 LLM providers (OpenAI Chat / OpenAI Responses / Anthropic) instrumented with `debug!` (request URL/model/message_count) + `trace!` (request body, SSE events) + `debug!` (HTTP error response, stream started)
-- Context compaction's hidden LLM call now logs `debug!` (start) and `warn!` (stream error)
-- Document includes PR-review checklist (§9) and phase-review checklist (§10) for ongoing observability discipline
-
-**Platform Abstraction — `crates/lim-core/src/{env,inject}.rs` + `crates/lim-tools/src/shell.rs`**
-
-- `PlatformInfo` (env module) — immutable startup snapshot of OS / arch / shell / workspace_roots. Detection layer, decoupled from injection
-- `InjectInfo` (inject module) — application layer that renders `PlatformInfo` into a system-prompt fragment with per-shell guidance (POSIX/BSD-vs-GNU differences, Git Bash drive mounts, WSL `/mnt/`, PowerShell cmdlets)
-- `ShellBackend` trait + 4 implementations: `PosixSh` (Unix default), `GitBash` (Windows priority 1), `Wsl` (priority 2), `PowerShell` (priority 3 fallback). `cmd.exe` intentionally never used — no mainstream agent uses it
-- `BashTool` renamed to `ShellTool` (tool name `"bash"` → `"shell"`). Single tool exposed to LLM; backend selected once at startup and held as `Arc<dyn ShellBackend>` for the session
-- `apps/cli` and `apps/tui` now detect platform at startup, inject the fragment into the system prompt, and print platform info to stderr for user visibility
-- +22 tests (198→262): 8 env + 8 inject + 9 shell backend/tool
-
-**Compaction Observability — `crates/lim-agent/src/context_window.rs`**
-
-- `ContextCompacted` event extended with `summary_model` / `summary_prompt_tokens` / `summary_completion_tokens` — closes the last black-box point in behavior-trace.md §8.1
-- `summarize()` now returns `(String, Usage)` capturing the provider's token usage report
-- TUI status bar shows `summary cost: N tokens via MODEL` on compaction
-- behavior-trace.md §8.1 upgraded from "部分黑盒" to "✅ 完全可观测"
+- 6 design principles in [behavior-trace.md](docs/architecture/behavior-trace.md)
+- All silent-failure paths now emit `warn!` instead of silently dropping events
+- `PlatformInfo` + `InjectInfo` + `ShellBackend` trait (PosixSh / GitBash / Wsl / PowerShell)
+- `BashTool` → `ShellTool` (tool name `"shell"`, backend selected at startup)
+- `ContextCompacted` event extended with `summary_model` / `summary_prompt_tokens` / `summary_completion_tokens` — closes §8.1 black-box
 
 ### Packaging Phase A Preparation — DONE
 
-- `[profile.release]` in `Cargo.toml`: `lto = "fat"` / `codegen-units = 1` / `strip = "symbols"` / `panic = "abort"`. Release binary: `lim` 5.4M / `novel-cli` 4.6M
-- `.github/workflows/ci.yml`: fmt check + clippy (-D warnings) + build + test + cross-compile check (Windows + macOS targets)
-- `.github/workflows/release.yml`: 6-target matrix (Linux x86_64/ARM64 + Windows x86_64/ARM64 + macOS ARM64/x86_64) + GitHub Release upload via `softprops/action-gh-release`
-- `docs/packaging-plan.md` updated: 3/4 code blockers marked ✅ DONE, open questions expanded
-- Remaining before first release: fix repo URL placeholder, add LICENSE + README.md, verify reqwest rustls-tls cross-compilation on CI
+- `[profile.release]`: `lto = "fat"` / `codegen-units = 1` / `strip = "symbols"` / `panic = "abort"`
+- `.github/workflows/ci.yml`: fmt + clippy (-D warnings) + build + test + cross-compile check
+- `.github/workflows/release.yml`: 6-target matrix + GitHub Release upload
+- `.github/dependabot.yml`: weekly updates (Cargo + Actions), minor+patch grouped, major separate
+- MSRV: `rust-version = "1.95"` in Cargo.toml (follows Bevy's stable-tracking strategy)
+- See [packaging-plan.md](docs/packaging-plan.md) for remaining release blockers
+
+### P0-P3: Loop Engineering Foundations — DONE
+
+- **P0** (阶段 1 完成 + Loop 成熟度 A): AgentHooks should_stop/max_steps, StateLedger, LoopRunner (start_goal/resume_goal), CLI `lim loop`, CommandVerifier
+- **P1** (阶段 2 起步 + Loop 成熟度 B): AgentTransport trait (LocalChannelTransport), Scheduler 雏形, LlmVerifier + 无进展检测
+- **P2** (阶段 3 完整): ControllerRegistry (CRD 类比), AI-native 元工具, LoopEvent broadcast
+- **P3** (阶段 4 起步): daemon 常驻进程骨架 (in-process IPC), DaemonLedger, P2P 网络拓扑, 多 workspace 管理, CLI `loop-daemon`
+
+### P2.5: Reviewer Agent — DONE
+
+`ReviewerVerifier` + fresh context + tool access = CC "第二 agent 代码审查" pattern. CLI: `--verify reviewer`.
+
+### P3.5: Product Layer Completion — DONE
+
+- CLI 暴露 LlmVerifier 入口 (`--verify llm` + `--verifier-provider/model/instructions`)
+- 完成契约写进设计哲学 ([loop-engineering.md](docs/architecture/loop-engineering.md) §一 + §12.6)
+
+### P4: Time-based Loop + Multi-agent Workspace — DONE
+
+11 sub-tasks, all ✅:
+
+| Task | Description |
+| :--- | :--- |
+| P4.1 | XDG config system (`~/.config/lim/`, `~/.local/share/lim/`, `~/.cache/lim/`) + `crates/lim-config/` |
+| P4.2 | `StatusProvider` trait + `ComponentStatus` + `Condition` (k8s-style, Event vs Status separation) |
+| P4.3 | `EventEnvelope.agent_id` field (multi-agent session disambiguation) |
+| P4.4 | LoopEvent 落盘 + §8.4 黑盒闭合 (`LoopEventPersister` + `ReviewPersister`) |
+| P4.5 | 角色配置 `.lim/agents/<role>.toml` + `AgentFactory::for_role` + `ToolRegistry::filtered_clone` |
+| P4.6 | Worktree 管理 (`WorktreeHandle` RAII, `.lim/worktrees/<id>/`) |
+| P4.7 | Skill 系统 (`crates/lim-skills/`, `SkillLoader`, `SkillVerifier` delegates to Command/Llm) |
+| P4.8 | Time-based loop (`Timer` trait + `IntervalTimer` + `TimerLoop` + `LoopEvent::TimeTriggered`) |
+| P4.9 | daemon IPC 抽象 (`IpcTransport` trait + `GoalRunner` trait + `DaemonServer::with_goal_runner`) |
+| P4.10 | 成本控制 (`BackoffStrategy` trait + `FixedBackoff` + `LoopRunner::with_backoff`) |
+| P4.11 | 全量验证 (cargo test + clippy + fmt) |
+
+### B-1/B-2: Behavior Observability Cleanup — DONE (2026-07-03)
+
+- **B-1**: `SessionEventPersister` 持久化主 agent `AgentEvent` 到 `.lim/loop/<goal_id>/session-<N>.jsonl` (previously `event_rx` was discarded)
+- **B-2**: `Verifier` trait returns `VerifyOutcome { result, metadata: VerifyMetadata { session_id, tokens_used } }`; `LoopEvent::VerificationDone` now populated from metadata
+- §8.4 black-box points in [behavior-trace.md](docs/architecture/behavior-trace.md) fully closed
 
 ## Planned
 
-### Phase 4: Strong Isolation & External Tools
+### v0.1 Release
 
-Goal: L1/L2 isolation and extension system.
+Pre-release cleanup (see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)):
 
-- ContainerExecutor (bwrap / sandbox-exec)
-- RemoteExecutor
-- Process JSON-RPC / MCP tool protocol
-- Wasm tool runtime
+- History squash: tag `v0.0.1-pre-squash`, collapse to 5-6 logical commits, update doc hash references
+- Packaging blockers: fix repo URL placeholder, add LICENSE + README.md (see [packaging-plan.md](docs/packaging-plan.md) Open Questions)
+- novel-cli packaging strategy: treat as extension, not independent CLI package
 
-Acceptance:
+### P4+: Proactive Loop (远期)
 
-- [ ] Host agent + sandboxed tools mode operational
-- [ ] External process tools register schemas and are invoked by agent
-- [ ] Wasm tools only access explicitly granted host functions
+- Proactive routine 组合 (schedule + goal + 动态工作流 + auto mode)
+- 中心化调度策略实现 (CentralizedTopology 实体化)
+- daemon 跨 workspace goal 聚合查询
 
 ## Crate Inventory
 
-| Crate | Layer | Phase | Tests |
-| :--- | :--- | :--- | :--- |
-| lim-core | Foundation | 1+3 | 53 (env 8 + inject 8 + usage 2 + others) |
-| lim-llm | Foundation | 1+3 | 66 (3 providers + http + error) |
-| lim-agent | Core | 1+3 | 49 (agent_loop + context_window + registry + stream_accumulator + hooks) |
-| lim-executor | Core | 1 | 16 (local + executor trait) |
-| lim-tools | Core | 1+3 | 8 (shell + read + write + edit) |
-| lim-session | Core | 1+3 | 11 (writer + replay) |
-| lim-workflow | Orchestration | 2 | 22 (DAG executor + artifact store) |
-| lim (apps/cli) | Entry | 1+3 | 0 (integration tests in /tests) |
-| lim-tui (apps/tui) | Frontend | 3 | 18 (app + ui + approval) |
-| novel-pack (packs/novel) | Domain | 2 | 15 |
-| tests/ (integration) | | | 4 (config_integration) |
-| **Total** | | | **262** |
+| Crate | Layer | Tests |
+| :--- | :--- | :--- |
+| lim-core | Foundation | 57 |
+| lim-llm | Foundation | 66 (+4 integration) |
+| lim-agent | Core | 170 |
+| lim-executor | Core | 16 |
+| lim-tools | Core | 13 |
+| lim-session | Core | 24 |
+| lim-config | Foundation | 12 |
+| lim-skills | Foundation | 11 |
+| lim-workflow | Orchestration | 22 |
+| lim (apps/cli) | Entry | 0 |
+| lim-tui (apps/tui) | Frontend | 22 |
+| novel-pack (packs/novel) | Domain | 15 |
+| **Total** | | **432** |

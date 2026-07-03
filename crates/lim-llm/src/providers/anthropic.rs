@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use lim_core::id::ToolCallId;
+use lim_core::prompt::PromptLayout;
 use lim_core::stop_reason::StopReason;
 use lim_core::tool::ToolSchema;
 use lim_core::usage::Usage;
@@ -96,10 +97,19 @@ impl AnthropicProvider {
     }
 
     /// Build the JSON request body for `/v1/messages`.
+    ///
+    /// ## Prompt caching
+    ///
+    /// When `request.prompt_layout` is set, the system prompt is sent as an
+    /// array of content blocks with `cache_control: { type: "ephemeral" }`
+    /// markers at segment boundaries (Anthropic's prompt caching API).
+    ///
+    /// When `prompt_layout` is `None`, falls back to the flat `system` string
+    /// (legacy behavior, no cache control).
+    ///
+    /// Cache breakpoints are placed at the end of each tier group (Static,
+    /// Project) to maximize prefix reuse. See `PromptLayout::cache_breakpoints`.
     fn build_request_body(&self, request: &LlmRequest) -> serde_json::Value {
-        // Anthropic separates system prompt from messages
-        let system_text = request.system.clone().unwrap_or_default();
-
         let mut messages: Vec<serde_json::Value> = Vec::new();
         for msg in &request.messages {
             if let Some(converted) = convert_message(msg) {
@@ -114,8 +124,16 @@ impl AnthropicProvider {
             "stream": true,
         });
 
-        if !system_text.is_empty() {
-            body["system"] = serde_json::json!(system_text);
+        // System prompt: prefer structured layout (cache-aware) over flat string.
+        if let Some(ref layout) = request.prompt_layout {
+            let system_blocks = build_anthropic_system_blocks(layout);
+            if !system_blocks.is_empty() {
+                body["system"] = serde_json::Value::Array(system_blocks);
+            }
+        } else if let Some(ref system) = request.system
+            && !system.is_empty()
+        {
+            body["system"] = serde_json::json!(system);
         }
 
         if !request.tools.is_empty() {
@@ -270,10 +288,24 @@ impl AnthropicStreamState {
 
         match event_type {
             "message_start" => {
-                // Extract usage.input_tokens if present
+                // Extract usage: input_tokens + cache_read_input_tokens +
+                // cache_creation_input_tokens. output_tokens arrive later in
+                // `message_delta`. The accumulator merges the two Usage
+                // events via `Usage::merge`, so input_tokens survive.
                 if let Some(usage) = payload.get("message").and_then(|m| m.get("usage")) {
                     let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    return vec![StreamEvent::Usage(Usage::new(input, 0))];
+                    let cache_read =
+                        usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache_creation = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    return vec![StreamEvent::Usage(Usage::with_cache_full(
+                        input,
+                        0,
+                        cache_read,
+                        cache_creation,
+                    ))];
                 }
                 vec![]
             }
@@ -532,6 +564,78 @@ fn convert_tool_schema(schema: &ToolSchema) -> serde_json::Value {
     })
 }
 
+/// Build Anthropic system prompt content blocks from a [`PromptLayout`].
+///
+/// Anthropic's API accepts `system` as either a string or an array of
+/// content blocks. When prompt caching is desired, the array form must be
+/// used with `cache_control: { type: "ephemeral" }` markers at the desired
+/// breakpoint positions.
+///
+/// This function groups segments by tier and emits one text block per
+/// tier group (concatenating segments within the same tier). A cache
+/// breakpoint is placed at the end of each Static, Project, and Session
+/// tier group. Dynamic tier gets no breakpoint.
+///
+/// Session-tier segments are excluded from the system blocks — they
+/// represent conversation history, which goes into `messages`. Only
+/// Static, Project, and Dynamic tiers form the system prompt.
+fn build_anthropic_system_blocks(layout: &PromptLayout) -> Vec<serde_json::Value> {
+    use lim_core::prompt::CacheTier;
+
+    let breakpoints: std::collections::HashSet<usize> =
+        layout.cache_breakpoints().into_iter().collect();
+
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    let mut current_text = String::new();
+
+    for (i, seg) in layout.segments.iter().enumerate() {
+        // Session-tier segments go to messages, not system blocks.
+        if matches!(seg.tier, CacheTier::Session) {
+            continue;
+        }
+
+        if !current_text.is_empty() {
+            current_text.push_str("\n\n");
+        }
+        current_text.push_str(&seg.content);
+
+        // If this segment is a breakpoint boundary, flush the accumulated
+        // text as a block with cache_control.
+        let is_breakpoint = breakpoints.contains(&i);
+        let is_last = i == layout.segments.len() - 1;
+        let next_is_session_or_different_tier = if is_last {
+            true
+        } else {
+            let next_tier = layout.segments[i + 1].tier;
+            next_tier != seg.tier || matches!(next_tier, CacheTier::Session)
+        };
+
+        if is_breakpoint && next_is_session_or_different_tier && !current_text.is_empty() {
+            let mut block = serde_json::json!({
+                "type": "text",
+                "text": current_text.clone(),
+            });
+            // Only Static and Project tiers get cache_control. Dynamic
+            // content is never cached (it changes every turn).
+            if matches!(seg.tier, CacheTier::Static | CacheTier::Project) {
+                block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            }
+            blocks.push(block);
+            current_text.clear();
+        }
+    }
+
+    // Flush any remaining text (Dynamic tier without a following breakpoint).
+    if !current_text.is_empty() {
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "text": current_text,
+        }));
+    }
+
+    blocks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,6 +731,50 @@ mod tests {
         assert!(
             e4.iter().any(|e| matches!(e, StreamEvent::Done { stop_reason: StopReason::ToolCall }))
         );
+    }
+
+    #[test]
+    fn parse_message_start_extracts_cache_fields() {
+        // Realistic Anthropic message_start payload when prompt caching is on.
+        // - input_tokens: 2529 (fresh, non-cached input)
+        // - cache_read_input_tokens: 1000 (served from cache, ~0.1x cost)
+        // - cache_creation_input_tokens: 500 (written to cache, ~1.25x cost)
+        let mut state = AnthropicStreamState::default();
+        let ev = make_event(
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet-20241022","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2529,"cache_creation_input_tokens":500,"cache_read_input_tokens":1000,"output_tokens":1}}}"#,
+        );
+        let events = state.parse_event(&ev);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 2529, "input_tokens");
+                assert_eq!(u.cached_tokens, 1000, "cache_read → cached_tokens");
+                assert_eq!(u.cache_creation_tokens, 500, "cache_creation_tokens");
+                assert_eq!(u.output_tokens, 0, "output_tokens not yet known at message_start");
+            }
+            _ => panic!("expected Usage event"),
+        }
+    }
+
+    #[test]
+    fn parse_message_start_without_cache_fields() {
+        // When prompt caching is off, cache_*_input_tokens are absent.
+        let mut state = AnthropicStreamState::default();
+        let ev = make_event(
+            "message_start",
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":100}}}"#,
+        );
+        let events = state.parse_event(&ev);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 100);
+                assert_eq!(u.cached_tokens, 0);
+                assert_eq!(u.cache_creation_tokens, 0);
+            }
+            _ => panic!("expected Usage event"),
+        }
     }
 
     #[test]

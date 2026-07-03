@@ -197,6 +197,35 @@ pub enum AgentEvent {
         /// Max retries the agent loop will attempt before giving up.
         max_retries: u32,
     },
+
+    /// One or more steering messages were drained from the steering queue
+    /// and injected into the conversation as User messages.
+    ///
+    /// Emitted at the turn boundary (before `TurnStart` of the next turn)
+    /// when the `AgentLoop` drains pending `SteeringMessage`s from its
+    /// inbound mpsc channel. The injected messages become part of the
+    /// conversation history and will be visible to the LLM in the next
+    /// request. See `docs/architecture/behavior-trace.md` for the
+    /// observability requirement behind this event.
+    ///
+    /// This is the observable signal for an otherwise-implicit behavior:
+    /// without this event, a JSONL reader would see a User message appear
+    /// in the conversation with no explanation of where it came from.
+    SteeringMessageApplied {
+        /// Number of steering messages drained and injected this turn.
+        count: usize,
+        /// The injected message contents (in arrival order).
+        ///
+        /// We persist the content (not just the count) so that session
+        /// replay reproduces the exact conversation the LLM saw. This
+        /// is consistent with how `MessageEnd` persists the full message.
+        contents: Vec<String>,
+        /// Unix ms timestamps when each message was originally enqueued
+        /// (parallel to `contents`). Lets a reader measure steering
+        /// latency (time from enqueue to apply).
+        #[serde(default)]
+        enqueued_at: Vec<u64>,
+    },
 }
 
 /// Envelope wrapping every event with correlation IDs.

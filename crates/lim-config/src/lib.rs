@@ -28,12 +28,14 @@
 //! stays inside the project. Only global defaults and cross-project data
 //! (global agent definitions, daemon state) move to XDG paths.
 
+pub mod context_loader;
 pub mod error;
 pub mod loader;
 pub mod paths;
 pub mod schema;
 
+pub use context_loader::{LoadedContext, load_context_files};
 pub use error::{ConfigError, ConfigResult};
 pub use loader::ConfigLoader;
 pub use paths::{ProjectPaths, XdgPaths};
-pub use schema::WorkspaceConfig;
+pub use schema::{ContextFileConfig, ContextFileEntry, ContextSearch, WorkspaceConfig};

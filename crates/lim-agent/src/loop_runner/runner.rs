@@ -24,6 +24,7 @@ use lim_core::message::AgentMessage;
 use crate::agent_loop::{AgentConfig, AgentLoop, AgentRoleSpec};
 use crate::context_window::{ContextConfig, ContextWindowManager};
 use crate::hooks::AgentHooks;
+use crate::prompt_builder::PromptBuilder;
 use crate::registry::ToolRegistry;
 
 use super::backoff::BackoffStrategy;
@@ -52,6 +53,16 @@ pub struct AgentFactory {
     /// Optional hooks (e.g. approval, no-progress) injected into every
     /// session created by this factory.
     hooks: Option<Arc<dyn AgentHooks>>,
+    /// Optional cache-aware prompt builder. When set, each session gets a
+    /// clone and the AgentLoop uses PromptLayout (with cache breakpoints)
+    /// instead of the flat `system_prompt` string. This is what makes
+    /// Anthropic prompt caching actually fire.
+    prompt_builder: Option<PromptBuilder>,
+    /// When `true`, each session created by this factory gets a steering
+    /// channel pair. The `Sender` is returned to the caller so the UI/CLI
+    /// layer can enqueue steering messages while the agent runs.
+    /// When `false` (default), no steering channel is created.
+    steering_enabled: bool,
     #[allow(dead_code)]
     sessions_dir: Utf8PathBuf,
 }
@@ -66,13 +77,44 @@ impl AgentFactory {
         context_config: Option<ContextConfig>,
         sessions_dir: Utf8PathBuf,
     ) -> Self {
-        Self { provider, registry, config, context_config, hooks: None, sessions_dir }
+        Self {
+            provider,
+            registry,
+            config,
+            context_config,
+            hooks: None,
+            prompt_builder: None,
+            steering_enabled: false,
+            sessions_dir,
+        }
     }
 
     /// Attach hooks (e.g. approval, NoProgress at turn level) to every
     /// session produced by this factory.
     pub fn with_hooks(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
         self.hooks = Some(hooks);
+        self
+    }
+
+    /// Attach a cache-aware [`PromptBuilder`] to every session produced by
+    /// this factory. Each session gets a clone; the builder is responsible
+    /// for emitting `PromptLayout` with cache breakpoints so Anthropic
+    /// prompt caching fires on the system prompt prefix.
+    pub fn with_prompt_builder(mut self, builder: PromptBuilder) -> Self {
+        self.prompt_builder = Some(builder);
+        self
+    }
+
+    /// Enable steering for every session produced by this factory.
+    ///
+    /// When enabled, [`Self::create_session_with_steering`] returns a
+    /// `(AgentLoop, Receiver, Sender)` triple where the `Sender` lets the
+    /// caller enqueue [`SteeringMessage`]s while the agent runs.
+    /// [`Self::create_session`] (the legacy 2-tuple API) ignores steering
+    /// and discards the sender — callers that want steering must use
+    /// `create_session_with_steering`.
+    pub fn with_steering_enabled(mut self) -> Self {
+        self.steering_enabled = true;
         self
     }
 
@@ -110,7 +152,28 @@ impl AgentFactory {
     /// Create a fresh AgentLoop for a new session, with a new broadcast
     /// channel and cancellation token. The caller is responsible for
     /// subscribing to the channel (e.g. to write session JSONL).
+    ///
+    /// When steering is enabled on this factory, the steering channel
+    /// sender is created but discarded here. Callers that need the
+    /// sender must use [`Self::create_session_with_steering`].
     pub fn create_session(&self) -> (AgentLoop, broadcast::Receiver<EventEnvelope>) {
+        let (agent, event_rx, _steering_tx) = self.create_session_with_steering();
+        (agent, event_rx)
+    }
+
+    /// Create a fresh AgentLoop with an optional steering channel.
+    ///
+    /// Returns `(agent, event_rx, Option<steering_tx>)`. When steering is
+    /// disabled on this factory, `steering_tx` is `None`. When enabled,
+    /// the caller gets the `UnboundedSender` and can enqueue
+    /// [`SteeringMessage`]s while the agent runs.
+    pub fn create_session_with_steering(
+        &self,
+    ) -> (
+        AgentLoop,
+        broadcast::Receiver<EventEnvelope>,
+        Option<tokio::sync::mpsc::UnboundedSender<lim_core::SteeringMessage>>,
+    ) {
         let (event_tx, event_rx) = broadcast::channel(256);
         let cancel = CancellationToken::new();
         let mut agent = AgentLoop::new(
@@ -129,7 +192,19 @@ impl AgentFactory {
             agent = agent.with_hooks(Arc::clone(hooks));
         }
 
-        (agent, event_rx)
+        if let Some(ref builder) = self.prompt_builder {
+            agent = agent.with_prompt_builder(builder.clone());
+        }
+
+        let steering_tx = if self.steering_enabled {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            agent = agent.with_steering_channel(rx);
+            Some(tx)
+        } else {
+            None
+        };
+
+        (agent, event_rx, steering_tx)
     }
 }
 
@@ -346,6 +421,100 @@ impl LoopRunner {
         Some(LoopEventPersister { handle, cancel })
     }
 
+    /// Spawn a background task to persist the main agent's `AgentEvent`s
+    /// for one session to `<loop_dir>/<goal_id>/session-<N>.jsonl`.
+    ///
+    /// This closes the §8.4 black-box for the main agent: without this
+    /// persister, the agent's `TurnStart` / `MessageStart` /
+    /// `ToolExecutionStart` / `ToolExecutionEnd` / `MessageEnd` events
+    /// would never reach disk, making it impossible to replay a session's
+    /// full behavior trace. Only `LoopEvent`s (the loop-level wrapper)
+    /// would be recorded.
+    ///
+    /// Returns `None` when `loop_dir` is not set (e.g. in tests). The
+    /// returned `SessionEventPersister` must be `finish()`ed after the
+    /// session completes to flush remaining events.
+    fn spawn_session_event_persister(
+        &self,
+        event_rx: broadcast::Receiver<EventEnvelope>,
+        goal_id: &GoalId,
+        session_number: usize,
+    ) -> Option<SessionEventPersister> {
+        let loop_dir = self.loop_dir.as_deref()?;
+        let path: Utf8PathBuf =
+            loop_dir.join(goal_id.to_string()).join(format!("session-{session_number}.jsonl"));
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            Self::run_session_event_persister(event_rx, &path, cancel_clone).await;
+        });
+        Some(SessionEventPersister { handle, cancel })
+    }
+
+    /// Drain `rx` and write each `EventEnvelope` as a JSONL line to `path`.
+    /// Stops when `cancel` is cancelled, then drains remaining buffered events.
+    ///
+    /// Mirrors `run_loop_event_persister` but consumes `EventEnvelope`
+    /// (agent-level events) instead of `LoopEvent`.
+    async fn run_session_event_persister(
+        mut rx: broadcast::Receiver<EventEnvelope>,
+        path: &Utf8Path,
+        cancel: CancellationToken,
+    ) {
+        if let Some(parent) = path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            warn!(error = %e, path = %path, "session event persister: failed to create dir");
+            return;
+        }
+        let mut file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, path = %path, "session event persister: failed to open file");
+                return;
+            }
+        };
+
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = rx.recv() => match result {
+                    Ok(event) => {
+                        if let Ok(line) = serde_json::to_string(&event) {
+                            if let Err(e) = file.write_all(line.as_bytes()).await {
+                                warn!(error = %e, "session event persister: write failed");
+                            }
+                            if let Err(e) = file.write_all(b"\n").await {
+                                warn!(error = %e, "session event persister: newline failed");
+                            }
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "session event persister: lagged, dropped events");
+                    }
+                }
+            }
+        }
+        // Drain remaining buffered events after cancellation.
+        while let Ok(event) = rx.try_recv() {
+            if let Ok(line) = serde_json::to_string(&event) {
+                let _ = file.write_all(line.as_bytes()).await;
+                let _ = file.write_all(b"\n").await;
+            }
+        }
+        let _ = file.flush().await;
+        debug!(path = %path, "session event persister: flushed and closed");
+    }
+
     /// Drain `rx` and write each `LoopEvent` as a JSONL line to `path`.
     /// Stops when `cancel` is cancelled, then drains remaining buffered events.
     async fn run_loop_event_persister(
@@ -470,8 +639,23 @@ impl LoopRunner {
             debug!(goal_id = %goal_id, session = session_number, "starting session");
             self.emit(LoopEvent::SessionStarted { goal_id: *goal_id, session_number });
 
-            // 3. Create a fresh AgentLoop and run one session
-            let (mut agent, _event_rx) = self.agent_factory.create_session();
+            // 3. Create a fresh AgentLoop and run one session.
+            //
+            // Spawn a SessionEventPersister that drains the agent's
+            // broadcast::Receiver and writes each AgentEvent as a JSONL
+            // line to `<loop_dir>/<goal_id>/session-<N>.jsonl`. This closes
+            // the §8.4 black-box for the *main* agent: without this, only
+            // LoopEvents (not the underlying TurnStart / MessageStart /
+            // ToolExecutionStart / ToolExecutionEnd / MessageEnd) would be
+            // recorded, making it impossible to replay a session's full
+            // behavior trace.
+            //
+            // When `loop_dir` is None (e.g. in tests), persistence is
+            // skipped and `event_rx` is simply dropped.
+            let (mut agent, event_rx) = self.agent_factory.create_session();
+            let session_id = agent.session_id();
+            let session_persister =
+                self.spawn_session_event_persister(event_rx, goal_id, session_number);
             let user_msg = AgentMessage::user(session_prompt);
 
             match agent.run(user_msg).await {
@@ -480,6 +664,11 @@ impl LoopRunner {
                 }
                 Err(e) => {
                     error!(goal_id = %goal_id, error = %e, "session failed");
+                    // Flush the session persister before returning so the
+                    // error path's AgentEvents (e.g. AgentEnd) are durable.
+                    if let Some(p) = session_persister {
+                        p.finish().await;
+                    }
                     state.status = GoalStatus::Failed(format!("session error: {e}"));
                     self.ledger.save(goal_id, &state).await?;
                     self.emit(LoopEvent::Error {
@@ -494,9 +683,15 @@ impl LoopRunner {
                 }
             }
 
+            // Flush remaining AgentEvents to disk before continuing. The
+            // persister is dropped after this; the file is closed.
+            if let Some(p) = session_persister {
+                p.finish().await;
+            }
+
             // 4. Update state
             state.session_count += 1;
-            state.last_session_id = Some(agent.session_id());
+            state.last_session_id = Some(session_id);
             state.updated_at = unix_now();
             self.ledger.save(goal_id, &state).await?;
             self.emit(LoopEvent::SessionEnded {
@@ -509,13 +704,14 @@ impl LoopRunner {
             // 5. Verify goal
             debug!(goal_id = %goal_id, "verifying goal");
             let ctx = VerifyContext { goal_id, loop_dir: self.loop_dir.as_deref() };
-            let verify_result = self.verifier.verify(&state, &ctx).await?;
+            let verify_outcome = self.verifier.verify(&state, &ctx).await?;
+            let verify_result = verify_outcome.result;
             self.emit(LoopEvent::VerificationDone {
                 goal_id: *goal_id,
                 result: verify_result.clone(),
                 verifier_kind: Some(self.verifier.kind().to_string()),
-                verifier_session_id: None,
-                verifier_tokens_used: None,
+                verifier_session_id: verify_outcome.metadata.session_id,
+                verifier_tokens_used: verify_outcome.metadata.tokens_used,
             });
             match verify_result {
                 VerifyResult::Pass => {
@@ -632,6 +828,28 @@ impl LoopEventPersister {
     }
 }
 
+/// Handle to a spawned session-event persister task.
+///
+/// Created by `LoopRunner::spawn_session_event_persister`. Call `finish()`
+/// after the session's `AgentLoop::run` returns to cancel the task and wait
+/// for it to flush remaining `AgentEvent`s to disk.
+///
+/// This is the per-session equivalent of `LoopEventPersister`. Each session
+/// in a Goal Loop gets its own `SessionEventPersister` writing to
+/// `<loop_dir>/<goal_id>/session-<N>.jsonl`.
+pub struct SessionEventPersister {
+    handle: tokio::task::JoinHandle<()>,
+    cancel: CancellationToken,
+}
+
+impl SessionEventPersister {
+    /// Cancel the persister and wait for it to flush remaining events.
+    pub async fn finish(self) {
+        self.cancel.cancel();
+        let _ = self.handle.await;
+    }
+}
+
 /// Current Unix time in seconds.
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -644,7 +862,7 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use crate::loop_runner::state::StateLedger;
-    use crate::loop_runner::verifier::AlwaysPassVerifier;
+    use crate::loop_runner::verifier::{AlwaysPassVerifier, VerifyOutcome};
     use camino::Utf8PathBuf;
     use lim_core::message::Role;
     use lim_llm::mock::{MockProvider, MockResponse};
@@ -712,8 +930,8 @@ mod tests {
                 &self,
                 _state: &LoopState,
                 _ctx: &VerifyContext<'_>,
-            ) -> Result<VerifyResult> {
-                Ok(VerifyResult::Fail("not done".into()))
+            ) -> Result<VerifyOutcome> {
+                Ok(VerifyOutcome::plain(VerifyResult::Fail("not done".into())))
             }
         }
 
@@ -918,8 +1136,8 @@ mod tests {
                 &self,
                 _state: &LoopState,
                 _ctx: &VerifyContext<'_>,
-            ) -> Result<VerifyResult> {
-                Ok(VerifyResult::Fail("not done".into()))
+            ) -> Result<VerifyOutcome> {
+                Ok(VerifyOutcome::plain(VerifyResult::Fail("not done".into())))
             }
         }
 
@@ -939,6 +1157,67 @@ mod tests {
         assert!(
             matches!(result, GoalResult::NeedsHuman(ref msg) if msg.contains("backoff")),
             "expected NeedsHuman with backoff message, got {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B-1 regression: with `loop_dir` set, the runner must persist both
+    /// LoopEvents (`events.jsonl`) and the main agent's AgentEvents
+    /// (`session-<N>.jsonl`). Previously the agent's `event_rx` was
+    /// discarded (`_event_rx`), so TurnStart/MessageStart/ToolExecutionStart/
+    /// ToolExecutionEnd/MessageEnd were never written to disk.
+    #[tokio::test]
+    async fn loop_dir_persists_session_and_loop_events() {
+        let dir = std::env::temp_dir().join("lim-test-loop-runner-persist");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let provider: Arc<dyn lim_llm::Provider> =
+            Arc::new(MockProvider::new(vec![MockResponse::Text("done".to_string())]));
+        let registry = Arc::new(ToolRegistry::new());
+        let factory = AgentFactory::new(
+            provider,
+            registry,
+            AgentConfig::default(),
+            None,
+            Utf8PathBuf::try_from(dir.join("sessions")).unwrap(),
+        );
+        let ledger = StateLedger::new(Utf8PathBuf::try_from(dir.clone()).unwrap());
+
+        let loop_dir = Utf8PathBuf::try_from(dir.join("loop")).unwrap();
+        let runner =
+            LoopRunner::new(factory, ledger, Box::new(AlwaysPassVerifier), Budget::unlimited())
+                .with_loop_dir(loop_dir.clone());
+
+        let (goal_id, result) = runner.start_goal("persist test").await.unwrap();
+        assert!(matches!(result, GoalResult::Success));
+
+        let goal_dir = loop_dir.join(goal_id.to_string());
+
+        // LoopEvents persisted to events.jsonl
+        let events_path = goal_dir.join("events.jsonl");
+        assert!(events_path.exists(), "events.jsonl should exist at {events_path}");
+        let events_content = std::fs::read_to_string(events_path.as_std_path()).unwrap();
+        assert!(!events_content.is_empty(), "events.jsonl should not be empty");
+        assert!(
+            events_content.contains("verification_done"),
+            "events.jsonl should contain VerificationDone: {events_content}"
+        );
+
+        // B-1: main agent AgentEvents persisted to session-1.jsonl.
+        // Before the fix, this file did not exist because `event_rx` was
+        // discarded.
+        let session_path = goal_dir.join("session-1.jsonl");
+        assert!(session_path.exists(), "session-1.jsonl should exist at {session_path}");
+        let session_content = std::fs::read_to_string(session_path.as_std_path()).unwrap();
+        assert!(
+            !session_content.is_empty(),
+            "session-1.jsonl should not be empty (B-1 regression)"
+        );
+        // The session JSONL should contain AgentEvent markers.
+        assert!(
+            session_content.contains("agent_start") || session_content.contains("agent_end"),
+            "session-1.jsonl should contain AgentEvent lines: {session_content}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -38,6 +38,24 @@ pub struct AgentMessage {
     /// Whether this tool result represents an error (only meaningful for Tool role).
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_error: bool,
+    /// Parent message in the conversation tree (Session Tree Phase 1).
+    ///
+    /// `None` means this is a root message (session start) OR the message
+    /// was written before Session Tree Phase 1 (legacy linear history).
+    /// In a linear `Vec<AgentMessage>` history, `parent_id` is informational
+    /// and does not affect LLM projection — [`convert_to_llm`] ignores it.
+    ///
+    /// **Phase 1 (current)**: all production constructors leave this as
+    /// `None`, preserving current linear semantics. The field is "dormant":
+    /// it serializes to JSONL (when set) but no runtime code reads it.
+    /// **Phase 2** will activate fork/rewind semantics via [`Self::with_parent`]
+    /// and new `AgentEvent` variants (`BranchCreated` / `BranchSwitched`).
+    ///
+    /// Serialization: `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// ensures legacy JSONL files (no `parent_id` field) deserialize as `None`,
+    /// and new files with `None` omit the field — byte-level backward compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<MessageId>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -53,6 +71,7 @@ impl AgentMessage {
             content: vec![ContentBlock::text(text)],
             tool_call_ids: Vec::new(),
             is_error: false,
+            parent_id: None,
         }
     }
 
@@ -64,6 +83,7 @@ impl AgentMessage {
             content,
             tool_call_ids: Vec::new(),
             is_error: false,
+            parent_id: None,
         }
     }
 
@@ -79,6 +99,7 @@ impl AgentMessage {
             content: vec![ContentBlock::text(output)],
             tool_call_ids: vec![tool_call_id],
             is_error,
+            parent_id: None,
         }
     }
 
@@ -90,7 +111,20 @@ impl AgentMessage {
             content: vec![ContentBlock::text(text)],
             tool_call_ids: Vec::new(),
             is_error: false,
+            parent_id: None,
         }
+    }
+
+    /// Set the parent message ID (Session Tree Phase 1 builder).
+    ///
+    /// Phase 1: only used in tests and by callers that explicitly opt in.
+    /// All production constructors leave `parent_id` as `None` to preserve
+    /// the current linear `Vec<AgentMessage>` semantics.
+    /// Phase 2: used by fork/rewind operations to link the new message
+    /// to its parent in the conversation tree.
+    pub fn with_parent(mut self, parent: MessageId) -> Self {
+        self.parent_id = Some(parent);
+        self
     }
 
     /// Extract all tool calls from this message's content blocks.
@@ -195,5 +229,55 @@ mod tests {
         let llm_msgs = convert_to_llm(&messages);
         assert_eq!(llm_msgs.len(), 3);
         assert_eq!(llm_msgs[0].role, Role::System);
+    }
+
+    #[test]
+    fn parent_id_defaults_none() {
+        // All constructors leave parent_id as None (Phase 1 linear semantics).
+        assert_eq!(AgentMessage::user("hi").parent_id, None);
+        assert_eq!(AgentMessage::assistant(vec![ContentBlock::text("x")]).parent_id, None);
+        assert_eq!(AgentMessage::tool_result(ToolCallId::new(), "out", false).parent_id, None);
+        assert_eq!(AgentMessage::system("sys").parent_id, None);
+    }
+
+    #[test]
+    fn with_parent_sets_field() {
+        let parent = MessageId::new();
+        let msg = AgentMessage::user("hi").with_parent(parent);
+        assert_eq!(msg.parent_id, Some(parent));
+    }
+
+    #[test]
+    fn parent_id_serde_roundtrip_some() {
+        let parent = MessageId::new();
+        let msg = AgentMessage::user("hi").with_parent(parent);
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.parent_id, Some(parent));
+        // Field is present in JSON when Some
+        assert!(json.contains("\"parent_id\""));
+    }
+
+    #[test]
+    fn parent_id_serde_omits_when_none() {
+        // When parent_id is None, the field must NOT appear in JSON — this
+        // is what makes new files byte-level compatible with legacy files
+        // that predate the parent_id field.
+        let msg = AgentMessage::user("hi");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("parent_id"));
+    }
+
+    #[test]
+    fn parent_id_legacy_deserializes_as_none() {
+        // A JSON object without the parent_id field (legacy file) must
+        // deserialize as None — this is the #[serde(default)] guarantee.
+        let legacy_json = r#"{
+            "id": "01KVWD0DAWV9BYM6XS736PV0ZR",
+            "role": "user",
+            "content": [{"type":"text","text":"hi"}]
+        }"#;
+        let parsed: AgentMessage = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.parent_id, None);
     }
 }

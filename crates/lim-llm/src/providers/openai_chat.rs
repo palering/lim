@@ -297,8 +297,16 @@ impl ChatStreamState {
 
         // Usage (arrives in final chunk when stream_options.include_usage = true)
         if let Some(usage) = chunk.usage {
-            events
-                .push(StreamEvent::Usage(Usage::new(usage.prompt_tokens, usage.completion_tokens)));
+            let cached = usage.prompt_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
+            // OpenAI semantics: prompt_tokens INCLUDES cached_tokens (subset,
+            // not additive). We keep input_tokens = prompt_tokens to preserve
+            // the provider's original accounting; consumers can read
+            // `cached_tokens` separately. See Usage docs.
+            events.push(StreamEvent::Usage(Usage::with_cache(
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                cached,
+            )));
         }
 
         if let Some(choice) = chunk.choices.first() {
@@ -424,6 +432,17 @@ struct OpenAiFunctionDelta {
 struct OpenAiUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// OpenAI reports cached prompt tokens as a sub-object when prompt
+    /// caching is active. The cached portion is a subset of
+    /// `prompt_tokens` (not additive).
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 // --- Helpers ---
@@ -641,6 +660,25 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Usage(_))));
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Done { .. })));
+    }
+
+    #[test]
+    fn parse_usage_with_cache_details() {
+        // OpenAI prompt caching: prompt_tokens_details.cached_tokens is a
+        // SUBSET of prompt_tokens (not additive). Here 200 input includes
+        // 100 cached.
+        let data = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":100}}}"#;
+        let mut state = ChatStreamState::default();
+        let events = parse(data, &mut state);
+        let usage_ev = events.iter().find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(u),
+            _ => None,
+        });
+        let u = usage_ev.expect("usage event should be present");
+        assert_eq!(u.input_tokens, 200, "prompt_tokens → input_tokens (includes cached)");
+        assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cached_tokens, 100, "cached subset extracted");
+        assert_eq!(u.cache_creation_tokens, 0, "OpenAI has no explicit cache creation");
     }
 
     /// Reproduces the original P0 bug: tool call deltas must carry the same

@@ -26,6 +26,7 @@ use crate::env::{PlatformInfo, ShellKind};
 ///
 /// Construct once at startup from a [`PlatformInfo`] snapshot and used to
 /// render fragments for various injection points.
+#[derive(Debug, Clone)]
 pub struct InjectInfo {
     platform: PlatformInfo,
 }

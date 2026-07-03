@@ -183,14 +183,14 @@ P3（阶段 4 起步）✅ 已完成
 - CLI loop-daemon 子命令
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-P3.5（product 层补全，基于 CC 调研）⏳ 待做
+P3.5（product 层补全，基于 CC 调研）✅ 已完成
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- CLI 暴露 LlmVerifier 入口（--verify llm + --verifier-provider + --verifier-model）
+- CLI 暴露 LlmVerifier 入口（--verify llm + --verifier-provider + --verifier-model + --verifier-instructions）
   harness 层 LlmVerifier 已支持独立 provider，纯 product 层补全
-- 文档：完成契约写进设计哲学（loop-engineering.md §一）
+- 文档：完成契约写进设计哲学（loop-engineering.md §一 + §12.6）
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-P4（阶段 4 完整 + CC Time-based loop + 多 agent workspace）⏳ 进行中
+P4（阶段 4 完整 + CC Time-based loop + 多 agent workspace）✅ 已完成
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 P4 拆解为 11 个子任务，按依赖顺序执行。设计原则：
@@ -328,7 +328,7 @@ P4+（CC Proactive loop）⏳ 远期
 |---|---|---|---|
 | Turn-based | `AgentLoop` | ✅ 已有 | P0 |
 | Goal-based | `LoopRunner` + `Verifier` | ✅ 已有 | P0-P1 |
-| Time-based | `DaemonServer` + 定时器 + Skill | ⏳ 进行中 | P4 (P4.7/P4.8) |
+| Time-based | `DaemonServer` + 定时器 + Skill | ✅ 已有 | P4 (P4.7/P4.8) |
 | Proactive | `ControllerRegistry` + `DaemonServer` + `Scheduler` + 多 workspace | ⏳ 远期 | P4+ |
 
 详见 loop-engineering.md §十二 行业参考。

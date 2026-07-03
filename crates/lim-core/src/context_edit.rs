@@ -92,6 +92,7 @@ pub fn apply_edit(messages: &[AgentMessage], edit: &ContextEdit) -> Vec<AgentMes
                     content: (*new_content).clone(),
                     tool_call_ids: msg.tool_call_ids.clone(),
                     is_error: msg.is_error,
+                    parent_id: msg.parent_id,
                 }
             } else {
                 msg.clone()

@@ -79,13 +79,13 @@ Located in `.github/workflows/release.yml` (to be created).
 
 ## Open Questions
 
-- [ ] Is `novel-cli` shipped in the same archive as `lim`, or released separately? `packs/` are domain samples; bundling them in the main release may bloat the archive for users who only want the runtime.
-- [ ] Repository URL `https://github.com/user/lim` in `Cargo.toml` is a placeholder — must be fixed before any public release. No git remote is configured yet.
-- [ ] Should `lim` binary embed version metadata at build time (`git describe --tags` → `env!`) so `lim --version` reports the release tag? Currently uses `CARGO_PKG_VERSION` (0.1.0) via clap's `#[command(version)]`.
+- [x] Repository URL — ✅ DONE: `Cargo.toml` declares `repository = "https://github.com/palering/lim"` and git remote `origin` is configured.
+- [x] LICENSE file — ✅ DONE: `LICENSE` (MIT) added at repo root, copyright "The lim authors". Matches `Cargo.toml` `license = "MIT"`.
+- [x] README.md — ✅ DONE: `README.md` exists at repo root with project intro, quick start, architecture overview, crate inventory, and doc links.
+- [ ] Is `novel-cli` shipped in the same archive as `lim`, or released separately? `packs/` are domain samples; bundling them in the main release may bloat the archive for users who only want the runtime. **Current decision**: treat novel-cli as an extension, not an independent CLI package — resolve packaging after current development phase.
+- [x] Should `lim` binary embed version metadata at build time (`git describe --tags` → `env!`) so `lim --version` reports the release tag? ✅ DONE: `crates/lim-core/build.rs` runs `git describe --tags --always --dirty=-dirty` and sets `LIM_BUILD_VERSION` env. `LIM_VERSION` prefers git description, falls back to `CARGO_PKG_VERSION` for tarball builds. Consumed by clap `#[command(version = lim_core::LIM_VERSION)]` and `SessionHeader.lim_version`.
 - [ ] Do we need musl (statically-linked) Linux builds, or is gnu (glibc) sufficient? musl enables truly portable single-binary distribution on Linux but rules out some native deps.
 - [ ] Code signing: macOS (notarization) and Windows (authenticode) — out of scope for Phase A, but should be planned for Phase B.
-- [ ] LICENSE file missing — `Cargo.toml` declares `license = "MIT"` but no `LICENSE` file exists. Release archive expects `LICENSE` per the archive layout above. Must be added before first public release.
-- [ ] README.md missing — release archive layout expects `README.md` in the archive. Must be added before first public release.
 
 ## What's NOT in Scope
 
