@@ -91,7 +91,7 @@ toml = "0.8"
 
 # TUI
 ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 [profile.release]
 # Reduce binary size and enable cross-module optimization.
