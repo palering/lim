@@ -57,7 +57,7 @@ camino = { version = "1", features = ["serde1"] }
 tracing = "0.1"
 
 # Schema generation
-schemars = "0.8"
+schemars = "1.2"
 
 # Async streams
 futures = "0.3"
