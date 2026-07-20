@@ -50,13 +50,20 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     /// Create a provider with an explicit API key.
     pub fn new(api_key: impl Into<String>) -> Self {
+        let mut extra_headers = HashMap::new();
+        // Default client identification. Users can override via
+        // `with_extra_headers` or config `extra_headers.User-Agent`.
+        // Some proxy providers gate access by client fingerprint —
+        // providing an honest default lets them recognize lim, and
+        // users can override when behind such proxies.
+        extra_headers.insert("User-Agent".to_string(), format!("lim/{}", lim_core::LIM_VERSION));
         Self {
             client: Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             full_url: None,
             anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
-            extra_headers: HashMap::new(),
+            extra_headers,
         }
     }
 
@@ -82,9 +89,16 @@ impl AnthropicProvider {
         self
     }
 
-    /// Add extra headers.
+    /// Merge extra headers into the provider's header set.
+    ///
+    /// User-supplied headers override defaults (including the default
+    /// `User-Agent: lim/<version>`). This merge semantic lets users
+    /// declare a different client identity when a proxy provider
+    /// requires it, while keeping other defaults intact.
     pub fn with_extra_headers(mut self, headers: HashMap<String, String>) -> Self {
-        self.extra_headers = headers;
+        for (k, v) in headers {
+            self.extra_headers.insert(k, v);
+        }
         self
     }
 

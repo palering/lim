@@ -116,6 +116,10 @@ impl ConfigLoader {
             // This is whole-value replacement (not deep merge of file lists),
             // which matches the "project overrides global" semantics.
             context: overlay.context.or(base.context),
+            // Serve config: overlay wins if set. Like context, this is
+            // whole-value replacement — project [serve] fully overrides
+            // global [serve] (no deep merge of sub-sections).
+            serve: overlay.serve.or(base.serve),
         }
     }
 
@@ -209,6 +213,7 @@ mod tests {
             agents: AgentSource::Project,
             providers: HashMap::new(),
             context: None,
+            serve: None,
         };
         let overlay = WorkspaceConfig {
             default_provider: Some("overlay".into()),
@@ -216,6 +221,7 @@ mod tests {
             agents: AgentSource::Hybrid,
             providers: HashMap::new(),
             context: None,
+            serve: None,
         };
         let merged = ConfigLoader::merge(base, overlay);
         assert_eq!(merged.default_provider.as_deref(), Some("overlay"));
@@ -231,6 +237,7 @@ mod tests {
             agents: AgentSource::Global,
             providers: HashMap::new(),
             context: None,
+            serve: None,
         };
         let overlay = WorkspaceConfig::default();
         let merged = ConfigLoader::merge(base, overlay);

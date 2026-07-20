@@ -379,3 +379,78 @@ struct CentralizedTransport { scheduler: SchedulerAddr }
 ```
 
 默认 P2P 同级组网，不依赖 master 节点，适合本机和小规模局域网。预留扩展能力可切换到中心化模式提高性能。
+
+## 七、对外通信协议层（A2A 统一 + MCP 双向）
+
+> 设计详件：[transport-layer.md](transport-layer.md) + [serve-mode.md](serve-mode.md)
+
+### 7.1 现状（截至 2026-07-04）
+
+lim **当前没有** A2A / ACP / MCP 支持。现有的 `AgentTransport` trait + `LocalChannelTransport` 是**自研的 in-process 通信抽象**（T0），用于同进程内多个 agent 间的 mpsc channel 通信。
+
+它是**内部通信抽象**，不是标准协议。不能让 lim 与外部 agent 系统互操作。
+
+### 7.2 协议矩阵（A2A 统一，不单独实现 ACP）
+
+**重要**：IBM ACP（Agent Communication Protocol）已于 2026 年 4 月正式归档合并入 A2A。Zed ACP（Agent Client Protocol）虽然名义上独立，但 A2A 协议定义的 Client 角色完全覆盖编辑器集成场景。**lim 只实现一套 A2A 协议栈，不单独实现 ACP**。
+
+| 协议 | 定位 | 层级 | 场景 | 何时实现 |
+|---|---|---|---|---|
+| **A2A** | agent 间通信 + 编辑器集成（一套覆盖） | Transport 层 | lim ↔ agent / lim ↔ 编辑器 | v0.2 |
+| **MCP** | 工具调用（双向） | Tool 层 + Serve 层 | lim ↔ 工具服务器 | v0.2 |
+| ~~ACP~~ | 不单独实现 | — | A2A Client 角色覆盖 | 不做 |
+
+### 7.3 四层传输光谱
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    编排层（不变）                              │
+│   Scheduler / NetworkTopology / Workflow / LoopRunner        │
+│   ↑ 只依赖 AgentTransport trait，不关心底层                    │
+├─────────────────────────────────────────────────────────────┤
+│ T0  In-Process      │ T1  Cross-Process     │ T2  Cross-Node │
+│ LocalChannelTransport│ UnixSocketTransport   │ TcpTransport   │
+│ 已实现 ✅            │ v0.2                  │ v0.2           │
+├─────────────────────┼──────────────────────┼────────────────┤
+│ T3  Cross-Network   │                       │                │
+│ A2AHttpTransport    │                       │                │
+│ v0.2                │                       │                │
+└─────────────────────┴───────────────────────┴────────────────┘
+```
+
+### 7.4 A2A 覆盖三个场景
+
+A2A 协议定义了 Client / Agent 两个角色，一套协议栈同时覆盖：
+
+- **lim agent ↔ 外部 agent 系统**（agent 间互联，lim 作为 Agent 或 Client）
+- **编辑器 ↔ lim agent**（编辑器集成，原 ACP 场景，lim 作为 Agent，编辑器作为 Client）
+- **CLI/GUI ↔ lim daemon**（客户端 ↔ agent）
+
+### 7.5 MCP 双向
+
+MCP 在 **Tool 层**，不在 Transport 层，有两个方向：
+
+- **MCP Server 模式**（对外暴露）：`lim serve --protocol mcp` 把 lim 包装成 MCP server，被其他 agent（Claude Code / Cursor）当工具调用
+- **MCP Client 模式**（对外调用）：lim 的 `ToolRegistry` 加 `McpToolProxy`，调用外部 MCP 工具服务器
+
+### 7.6 规划
+
+**v0.2 一次交付完整对外通信能力**：
+
+1. **`lim-transport` crate**：T1 跨平台传输（Unix socket / Named Pipe / TCP loopback）+ T2 TCP + T3 A2A HTTP + 协议适配器（LimNative + A2A）+ MCP Server/Client + 服务发现
+2. **`lim-serve` crate**：`lim serve` 统一入口 + foreground / --daemon / --system 三种运行模式 + 跨平台系统服务（systemd / launchd / Windows Service）
+3. **`lim serve` 命令**：`--protocol mcp,a2a --goal-daemon --system install` 一行搞定全聚合
+4. **`loop-daemon` 归并**：`loop-daemon start` → `lim serve --goal-daemon`，`submit/list/status/sync` 独立保留为 `lim goal ...`
+
+### 7.7 与 zerostack 的对比
+
+zerostack 已实现 ACP 支持（`--acp` 启动 JSON-RPC server），但**没有** A2A。lim 实现一套 A2A 协议栈，同时覆盖 agent 互联 + 编辑器集成两个场景，比 zerostack 多一个维度的互操作性，且不需要维护两套协议。
+
+### 7.8 关键设计决策
+
+- **为什么不直接上 A2A？** in-process 能覆盖 80% 的实际场景。直接上 A2A 对 80% 用户是过度设计
+- **为什么 ACP 不单独实现？** 已合并入 A2A，一套协议栈足够
+- **为什么 MCP 在 Tool 层？** MCP 是工具调用协议，与 `Tool` trait 一致
+- **为什么 T0 留 lim-agent？** in-process 是编排能力的一部分，搬到 lim-transport 会层级倒置
+
+详见 [transport-layer.md](transport-layer.md) 和 [serve-mode.md](serve-mode.md)。

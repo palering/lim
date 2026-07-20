@@ -48,6 +48,14 @@ pub struct WorkspaceConfig {
     /// When `Some(ContextFileConfig { enabled: true, files: [], .. })`, uses defaults.
     #[serde(default)]
     pub context: Option<ContextFileConfig>,
+
+    /// `lim serve` configuration (protocol defaults, goal daemon, system service).
+    ///
+    /// When `None`, `lim serve` uses built-in defaults (all protocols,
+    /// foreground mode, `.lim/daemon` storage). CLI flags override these
+    /// values.
+    #[serde(default)]
+    pub serve: Option<ServeConfig>,
 }
 
 /// Workspace isolation mode for multi-agent execution.
@@ -236,6 +244,100 @@ impl ContextFileConfig {
         } else {
             self.files.iter().collect()
         }
+    }
+}
+
+/// `lim serve` configuration section.
+///
+/// Controls the default behavior of `lim serve`. CLI flags override these
+/// values. When the entire `[serve]` section is absent, built-in defaults
+/// apply (all protocols, foreground mode, `.lim/daemon` storage).
+///
+/// ## TOML example
+///
+/// ```toml
+/// [serve]
+/// protocol = "all"          # "all" | "mcp" | "a2a" | "none"
+/// mode = "foreground"       # "foreground" | "daemon"
+///
+/// [serve.goal_daemon]
+/// enabled = true
+/// storage = ".lim/daemon"
+///
+/// [serve.system]
+/// service_name = "lim"
+/// auto_restart = true
+/// log_dir = ".lim/logs"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServeConfig {
+    /// Default protocol set for `lim serve`.
+    ///
+    /// Maps to the `--protocol` CLI flag. Values: `"all"`, `"mcp"`, `"a2a"`,
+    /// `"none"`. When `None`, the CLI default (`"all"`) applies.
+    #[serde(default)]
+    pub protocol: Option<String>,
+
+    /// Default run mode.
+    ///
+    /// Maps to the `--daemon` CLI flag. Values: `"foreground"`, `"daemon"`.
+    /// When `None`, foreground is used. The `--system` flag is not
+    /// configurable here — it's a one-shot action, not a run mode.
+    #[serde(default)]
+    pub mode: Option<String>,
+
+    /// Goal daemon sub-section.
+    #[serde(default)]
+    pub goal_daemon: GoalDaemonConfig,
+
+    /// System service sub-section (used by `lim serve --system install`).
+    #[serde(default)]
+    pub system: SystemServiceConfig,
+}
+
+/// Goal daemon configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalDaemonConfig {
+    /// Whether the goal daemon is active. Defaults to `true`.
+    ///
+    /// When `false`, `lim serve` runs without spawning the daemon server.
+    /// Goals cannot be submitted in this mode.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Storage root for the daemon ledger (relative to workspace or absolute).
+    ///
+    /// Defaults to `.lim/daemon` (containment principle — stays inside the
+    /// project directory during Phase 1–2).
+    #[serde(default)]
+    pub storage: Option<String>,
+}
+
+impl Default for GoalDaemonConfig {
+    fn default() -> Self {
+        Self { enabled: true, storage: None }
+    }
+}
+
+/// System service installation metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemServiceConfig {
+    /// Service name (e.g. `"lim"`). Defaults to `"lim"`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+
+    /// Whether the service should auto-restart on failure. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub auto_restart: bool,
+
+    /// Log directory for the service. Defaults to `.lim/logs`.
+    #[serde(default)]
+    pub log_dir: Option<String>,
+}
+
+impl Default for SystemServiceConfig {
+    fn default() -> Self {
+        Self { service_name: None, auto_restart: true, log_dir: None }
     }
 }
 
@@ -434,5 +536,78 @@ search = "subdirs"
         assert_eq!(ctx.files[1].search, ContextSearch::Fixed);
         assert_eq!(ctx.files[2].search, ContextSearch::WorkspaceRoot);
         assert_eq!(ctx.files[3].search, ContextSearch::Subdirs);
+    }
+
+    #[test]
+    fn parse_serve_config_absent() {
+        // No [serve] section → serve is None
+        let toml = r#"
+[providers.openai]
+type = "openai-chat"
+"#;
+        let config: WorkspaceConfig = toml::from_str(toml).unwrap();
+        assert!(config.serve.is_none());
+    }
+
+    #[test]
+    fn parse_serve_config_minimal() {
+        // [serve] with only top-level fields → sub-sections use defaults
+        let toml = r#"
+[serve]
+protocol = "mcp"
+mode = "daemon"
+"#;
+        let config: WorkspaceConfig = toml::from_str(toml).unwrap();
+        let serve = config.serve.expect("serve should be set");
+        assert_eq!(serve.protocol.as_deref(), Some("mcp"));
+        assert_eq!(serve.mode.as_deref(), Some("daemon"));
+        // goal_daemon defaults: enabled=true, storage=None
+        assert!(serve.goal_daemon.enabled);
+        assert!(serve.goal_daemon.storage.is_none());
+        // system defaults: auto_restart=true, others None
+        assert!(serve.system.auto_restart);
+        assert!(serve.system.service_name.is_none());
+        assert!(serve.system.log_dir.is_none());
+    }
+
+    #[test]
+    fn parse_serve_config_full() {
+        let toml = r#"
+[serve]
+protocol = "all"
+mode = "foreground"
+
+[serve.goal_daemon]
+enabled = true
+storage = ".lim/daemon"
+
+[serve.system]
+service_name = "lim"
+auto_restart = true
+log_dir = ".lim/logs"
+"#;
+        let config: WorkspaceConfig = toml::from_str(toml).unwrap();
+        let serve = config.serve.expect("serve should be set");
+        assert_eq!(serve.protocol.as_deref(), Some("all"));
+        assert_eq!(serve.mode.as_deref(), Some("foreground"));
+        assert!(serve.goal_daemon.enabled);
+        assert_eq!(serve.goal_daemon.storage.as_deref(), Some(".lim/daemon"));
+        assert_eq!(serve.system.service_name.as_deref(), Some("lim"));
+        assert!(serve.system.auto_restart);
+        assert_eq!(serve.system.log_dir.as_deref(), Some(".lim/logs"));
+    }
+
+    #[test]
+    fn parse_serve_config_goal_daemon_disabled() {
+        let toml = r#"
+[serve.goal_daemon]
+enabled = false
+"#;
+        let config: WorkspaceConfig = toml::from_str(toml).unwrap();
+        let serve = config.serve.expect("serve should be set");
+        assert!(!serve.goal_daemon.enabled);
+        // top-level fields default to None
+        assert!(serve.protocol.is_none());
+        assert!(serve.mode.is_none());
     }
 }

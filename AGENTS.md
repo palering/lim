@@ -2,7 +2,7 @@
 
 ## Containment Principle (Phase 1–2)
 
-All configuration, artifacts, sessions, and runtime outputs MUST stay within the project directory. Nothing escapes to `$HOME`, `/tmp`, or any system path during build, test, or normal execution.
+All configuration, artifacts, sessions, and runtime outputs SHOULD stay within the project directory during build, test, and normal execution.
 
 Concretely:
 
@@ -10,10 +10,16 @@ Concretely:
 - `sessions/` — JSONL event logs and workflow artifacts, gitignored.
 - `tests/fixtures/` — test input data, tracked in git.
 - `.lim-tmp-*` — transient atomic-write temps, created in the target file's parent directory and cleaned up by rename.
+- `.lim/` — project-local runtime state (loop/daemon/worktrees/config), gitignored.
 
-The only exception is `cargo test` writing to `std::env::temp_dir()` (e.g. `/tmp/lim-test-*`), which is standard Rust test practice with per-test cleanup.
+The only exceptions (relaxed since P4 / lim-config 引入):
 
-This constraint will be relaxed when lim ships a real config system (e.g. `~/.config/lim/`) or persistent data store. Until then, if any code path creates files outside the project tree, it is a bug.
+- `cargo test` writing to `std::env::temp_dir()` (e.g. `/tmp/lim-test-*`), standard Rust test practice with per-test cleanup.
+- `~/.config/lim/` — XDG global config (lim-config, P4 引入)
+- `~/.lim/lim.pid` — daemon PID file（lim-serve `--daemon` 模式）
+- `~/.lim/logs/` — daemon 日志目录（lim-serve `--daemon` 模式）
+
+项目本地状态（`.lim/loop/`、`.lim/daemon/`、`.lim/worktrees/`、`sessions/`）仍在项目内。系统服务安装文件（systemd unit / launchd plist）写入用户级 XDG 目录，不污染项目树。
 
 ## Code Conventions
 

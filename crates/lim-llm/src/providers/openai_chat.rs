@@ -51,12 +51,15 @@ pub struct OpenAiChatProvider {
 impl OpenAiChatProvider {
     /// Create a provider with an explicit API key.
     pub fn new(api_key: impl Into<String>) -> Self {
+        let mut extra_headers = HashMap::new();
+        // Default client identification — see AnthropicProvider::new for rationale.
+        extra_headers.insert("User-Agent".to_string(), format!("lim/{}", lim_core::LIM_VERSION));
         Self {
             client: Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             full_url: None,
-            extra_headers: HashMap::new(),
+            extra_headers,
         }
     }
 
@@ -76,9 +79,14 @@ impl OpenAiChatProvider {
         self
     }
 
-    /// Add extra headers (e.g. `HTTP-Referer` for OpenRouter).
+    /// Merge extra headers (e.g. `HTTP-Referer` for OpenRouter).
+    ///
+    /// User-supplied headers override defaults (including the default
+    /// `User-Agent: lim/<version>`).
     pub fn with_extra_headers(mut self, headers: HashMap<String, String>) -> Self {
-        self.extra_headers = headers;
+        for (k, v) in headers {
+            self.extra_headers.insert(k, v);
+        }
         self
     }
 

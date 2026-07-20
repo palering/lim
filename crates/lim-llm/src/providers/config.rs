@@ -279,9 +279,16 @@ pub fn create_provider(
             } else if !base_url.is_empty() {
                 p = p.with_base_url(base_url);
             }
-            // Extract anthropic-version from extra_headers if present
+            // Extract anthropic-version from extra_headers if present (legacy
+            // underscore-key form, kept for backward compat).
             if let Some(version) = instance.extra_headers.get("anthropic_version") {
                 p = p.with_version(version);
+            }
+            // Forward all extra headers (including User-Agent for client
+            // identification, anthropic-beta features, etc.). This was
+            // previously dropped — only `anthropic_version` was extracted.
+            if !instance.extra_headers.is_empty() {
+                p = p.with_extra_headers(instance.extra_headers.clone());
             }
             Ok(Arc::new(p))
         }
