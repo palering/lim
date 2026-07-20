@@ -42,6 +42,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize a lim workspace in the current directory.
+    ///
+    /// Creates `.lim/` with a `config.toml` template and an `AGENTS.md`
+    /// template. Run this once per project before using other lim commands.
+    ///
+    /// ## Examples
+    ///
+    ///   lim init                          # minimal template
+    ///   lim init --provider anthropic     # pre-fill anthropic provider
+    ///   lim init --provider openai        # pre-fill openai provider
+    ///   lim init --force                  # overwrite existing config.toml
+    Init {
+        /// Pre-fill a provider template (`anthropic` or `openai`).
+        ///
+        /// When omitted, the config template includes both providers
+        /// commented out.
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Overwrite an existing `.lim/config.toml`.
+        ///
+        /// Without this flag, `lim init` refuses to overwrite an existing
+        /// config file to prevent data loss.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Run an agent session (non-interactive, single message).
     Run {
         /// Named provider instance from `.lim/config.toml` (e.g. `openai-default`).
@@ -279,6 +306,78 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+
+    /// Manage goals in the daemon ledger (preferred alias for the
+    /// goal-management subset of `lim loop-daemon`).
+    ///
+    /// `lim goal` covers submit / list / status / pause / resume / sync.
+    /// Daemon lifecycle (start / shutdown) is handled by `lim serve
+    /// --goal-daemon` (the deprecated `lim loop-daemon start` still works).
+    ///
+    /// ## Examples
+    ///
+    ///   lim goal submit --goal "refactor module X" --workspace /path/to/ws
+    ///   lim goal list
+    ///   lim goal status 01J...
+    ///   lim goal sync 01J...
+    Goal {
+        #[command(subcommand)]
+        action: GoalAction,
+    },
+
+    /// Run lim as a long-running server (MCP + A2A + goal daemon).
+    ///
+    /// This is the unified entry point for all "persistent" modes. It
+    /// replaces `loop-daemon start` and provides MCP/A2A protocol
+    /// servers plus the goal daemon as built-in capabilities.
+    ///
+    /// ## Examples
+    ///
+    ///   lim serve                              # foreground, all protocols + goal daemon
+    ///   lim serve --protocol mcp               # MCP server only (testing)
+    ///   lim serve --protocol a2a               # A2A agent only (testing)
+    ///   lim serve --protocol none              # goal daemon only
+    ///   lim serve --daemon                     # background mode
+    ///   lim serve --system install             # install as system service
+    Serve {
+        /// Protocol to expose: `all` (default), `mcp`, `a2a`, or `none`.
+        ///
+        /// `all` enables both MCP and A2A (the default for a unified server).
+        /// `mcp` / `a2a` select a single protocol (mainly for testing).
+        /// `none` runs only the goal daemon.
+        ///
+        /// When omitted, falls back to `[serve].protocol` in the config file,
+        /// then to `"all"`.
+        #[arg(long)]
+        protocol: Option<String>,
+
+        /// Run in the background (detached from terminal).
+        ///
+        /// When neither `--daemon` nor `--system` is given, falls back to
+        /// `[serve].mode` in the config file, then to foreground.
+        #[arg(long)]
+        daemon: bool,
+
+        /// Manage system service installation (install/uninstall/start/stop/status/restart).
+        #[arg(long, value_name = "ACTION")]
+        system: Option<String>,
+
+        /// Workspace path to bind the server to.
+        #[arg(long)]
+        workspace: Option<Utf8PathBuf>,
+
+        /// Path to a config file (overrides default lookup).
+        #[arg(long)]
+        config: Option<Utf8PathBuf>,
+
+        /// Endpoint to bind on (e.g. `unix://path`, `tcp://host:port`, `http://host:port`).
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Auth token for A2A / network protocols.
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
 }
 
 /// Subcommands for `lim loop-daemon`.
@@ -351,6 +450,75 @@ enum DaemonAction {
     },
     /// Shut down a running daemon (in-process; for future IPC mode).
     Shutdown,
+}
+
+/// Subcommands for `lim goal` — goal-management actions.
+///
+/// This is the preferred alias for the goal-management subset of
+/// `lim loop-daemon` (submit / list / status / pause / resume / sync).
+/// The daemon lifecycle actions (start / shutdown) stay under
+/// `lim loop-daemon` (deprecated) and `lim serve --goal-daemon`.
+#[derive(Subcommand)]
+enum GoalAction {
+    /// Submit a new goal to the daemon ledger.
+    Submit {
+        /// Goal description.
+        #[arg(long)]
+        goal: String,
+        /// Optional workspace path to bind the goal to.
+        #[arg(long)]
+        workspace: Option<Utf8PathBuf>,
+        /// Optional verifier command (recorded for future execution).
+        #[arg(long)]
+        verify: Option<String>,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// List all goals in the daemon ledger.
+    List {
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Show status of a goal in the daemon ledger.
+    Status {
+        /// Goal ID.
+        goal_id: String,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Pause a goal (sets status to Paused in the ledger).
+    Pause {
+        /// Goal ID.
+        goal_id: String,
+        /// Optional pause reason.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Resume a paused goal (sets status back to Running).
+    Resume {
+        /// Goal ID.
+        goal_id: String,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
+    /// Sync a goal's state to its bound workspace's `.lim/loop/`.
+    Sync {
+        /// Goal ID.
+        goal_id: String,
+        /// Workspace root to sync to (overrides the bound workspace).
+        #[arg(long)]
+        workspace: Option<Utf8PathBuf>,
+        /// Storage root (default: .lim/daemon/).
+        #[arg(long)]
+        storage: Option<Utf8PathBuf>,
+    },
 }
 
 /// Fixture format for MockProvider scripted responses.
@@ -483,6 +651,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init { provider, force } => {
+            run_init(provider.as_deref(), force)?;
+        }
         Commands::Run { provider, model, fake, message, output, resume, trust } => {
             run_session(provider, model, fake, resume, message, output, trust).await?;
         }
@@ -539,6 +710,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::LoopDaemon { action } => {
             run_loop_daemon(action).await?;
+        }
+        Commands::Goal { action } => {
+            run_goal(action).await?;
+        }
+        Commands::Serve { protocol, daemon, system, workspace, config, endpoint, auth_token } => {
+            run_serve(
+                protocol.as_deref(),
+                daemon,
+                system.as_deref(),
+                workspace,
+                config,
+                endpoint,
+                auth_token,
+            )
+            .await?;
         }
     }
 
@@ -1769,6 +1955,26 @@ async fn run_loop_daemon(action: DaemonAction) -> anyhow::Result<()> {
     }
 }
 
+/// `lim goal <action>` — dispatch goal-management actions to the same
+/// handlers as `lim loop-daemon`. This is the preferred alias; `lim
+/// loop-daemon <action>` remains as a backward-compatible alias.
+async fn run_goal(action: GoalAction) -> anyhow::Result<()> {
+    match action {
+        GoalAction::Submit { goal, workspace, verify, storage } => {
+            run_daemon_submit(goal, workspace, verify, storage).await
+        }
+        GoalAction::List { storage } => run_daemon_list(storage).await,
+        GoalAction::Status { goal_id, storage } => run_daemon_status(goal_id, storage).await,
+        GoalAction::Pause { goal_id, reason, storage } => {
+            run_daemon_pause(goal_id, reason, storage).await
+        }
+        GoalAction::Resume { goal_id, storage } => run_daemon_resume(goal_id, storage).await,
+        GoalAction::Sync { goal_id, workspace, storage } => {
+            run_daemon_sync(goal_id, workspace, storage).await
+        }
+    }
+}
+
 /// `lim loop-daemon start` — start the in-process daemon server.
 ///
 /// Spawns the `DaemonServer` as a background task and prints a "running"
@@ -1776,7 +1982,13 @@ async fn run_loop_daemon(action: DaemonAction) -> anyhow::Result<()> {
 /// the task is killed. Since there's no IPC transport yet, this is mainly
 /// useful for integration tests; CLI clients should use the other subcommands
 /// directly (they operate on the same storage).
+///
+/// **Deprecated**: use `lim serve --goal-daemon` instead, which provides the
+/// same goal-management capability under the unified serve entry point.
 async fn run_daemon_start(storage: Option<Utf8PathBuf>) -> anyhow::Result<()> {
+    eprintln!(
+        "[deprecated] `lim loop-daemon start` is deprecated; use `lim serve --goal-daemon` instead."
+    );
     let storage_root = resolve_storage_root(storage);
     let ledger = DaemonLedger::new(storage_root.clone());
     let (server, handle) = DaemonServer::new(ledger);
@@ -2000,4 +2212,328 @@ async fn run_daemon_sync(
     println!("  lim loop --status {goal_id}");
     println!("  lim loop --resume {goal_id}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// lim init (`lim init ...`)
+// ---------------------------------------------------------------------------
+
+/// `lim init` — initialize a lim workspace in the current directory.
+///
+/// Creates `.lim/` with a `config.toml` template and an `AGENTS.md` template.
+/// The config template includes provider placeholders; `--provider` pre-fills
+/// a specific provider section.
+fn run_init(provider: Option<&str>, force: bool) -> anyhow::Result<()> {
+    use std::fs;
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
+    let lim_dir = cwd.join(".lim");
+    let config_path = lim_dir.join("config.toml");
+
+    // Check for existing config (unless --force)
+    if config_path.exists() && !force {
+        eprintln!("Error: `.lim/config.toml` already exists. Use `--force` to overwrite.");
+        std::process::exit(1);
+    }
+
+    // Create .lim/ directory
+    fs::create_dir_all(&lim_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create `.lim/` directory: {e}"))?;
+
+    // Generate config.toml template
+    let config_content = generate_config_template(provider);
+    fs::write(&config_path, &config_content)
+        .map_err(|e| anyhow::anyhow!("failed to write `.lim/config.toml`: {e}"))?;
+
+    eprintln!("Created: {}", config_path.display());
+
+    // Generate AGENTS.md template (only if it doesn't exist)
+    let agents_path = cwd.join("AGENTS.md");
+    if !agents_path.exists() {
+        let agents_content = generate_agents_template();
+        fs::write(&agents_path, &agents_content)
+            .map_err(|e| anyhow::anyhow!("failed to write `AGENTS.md`: {e}"))?;
+        eprintln!("Created: {}", agents_path.display());
+    } else {
+        eprintln!("Skipped: AGENTS.md already exists");
+    }
+
+    eprintln!("\nWorkspace initialized. Next steps:");
+    eprintln!("  1. Edit `.lim/config.toml` to fill in your API key");
+    eprintln!("  2. Edit `AGENTS.md` to add project conventions");
+    eprintln!("  3. Run `lim providers` to verify config loads");
+    eprintln!("  4. Run `lim run --message \"hello\"` to test");
+
+    Ok(())
+}
+
+/// Generate a config.toml template, optionally pre-filling a provider.
+fn generate_config_template(provider: Option<&str>) -> String {
+    match provider {
+        Some("anthropic") => r#"# lim workspace configuration
+# See: https://github.com/pale/lim for full docs
+
+default_provider = "anthropic"
+
+[providers.anthropic]
+type = "anthropic"
+# Set your API key here, or use api_key_env to read from an env var:
+api_key = "sk-ant-..."
+# api_key_env = "ANTHROPIC_API_KEY"
+default_model = "claude-sonnet-4-20250514"
+
+# Uncomment to add an OpenAI provider:
+# [providers.openai]
+# type = "openai-chat"
+# api_key = "sk-..."
+# default_model = "gpt-4o"
+
+# Context files loaded into the system prompt.
+# Default: AGENTS.md at workspace root.
+# [context]
+# enabled = true
+# [[context.files]]
+# name = "AGENTS.md"
+# search = "workspace_root"
+
+# lim serve configuration (protocol/mode defaults).
+# [serve]
+# protocol = "all"
+# mode = "foreground"
+# [serve.goal_daemon]
+# enabled = true
+# storage = ".lim/daemon"
+"#
+        .to_string(),
+
+        Some("openai") => r#"# lim workspace configuration
+# See: https://github.com/pale/lim for full docs
+
+default_provider = "openai"
+
+[providers.openai]
+type = "openai-chat"
+# Set your API key here, or use api_key_env to read from an env var:
+api_key = "sk-..."
+# api_key_env = "OPENAI_API_KEY"
+default_model = "gpt-4o"
+
+# Uncomment to add an Anthropic provider:
+# [providers.anthropic]
+# type = "anthropic"
+# api_key = "sk-ant-..."
+# default_model = "claude-sonnet-4-20250514"
+
+# Context files loaded into the system prompt.
+# Default: AGENTS.md at workspace root.
+# [context]
+# enabled = true
+# [[context.files]]
+# name = "AGENTS.md"
+# search = "workspace_root"
+
+# lim serve configuration (protocol/mode defaults).
+# [serve]
+# protocol = "all"
+# mode = "foreground"
+# [serve.goal_daemon]
+# enabled = true
+# storage = ".lim/daemon"
+"#
+        .to_string(),
+
+        _ => r#"# lim workspace configuration
+# See: https://github.com/pale/lim for full docs
+
+# Uncomment and fill in your provider:
+# default_provider = "anthropic"
+
+# [providers.anthropic]
+# type = "anthropic"
+# api_key = "sk-ant-..."
+# api_key_env = "ANTHROPIC_API_KEY"
+# default_model = "claude-sonnet-4-20250514"
+
+# [providers.openai]
+# type = "openai-chat"
+# api_key = "sk-..."
+# api_key_env = "OPENAI_API_KEY"
+# default_model = "gpt-4o"
+
+# Context files loaded into the system prompt.
+# Default: AGENTS.md at workspace root.
+# [context]
+# enabled = true
+# [[context.files]]
+# name = "AGENTS.md"
+# search = "workspace_root"
+
+# lim serve configuration (protocol/mode defaults).
+# [serve]
+# protocol = "all"
+# mode = "foreground"
+# [serve.goal_daemon]
+# enabled = true
+# storage = ".lim/daemon"
+"#
+        .to_string(),
+    }
+}
+
+/// Generate an AGENTS.md template.
+fn generate_agents_template() -> String {
+    r#"# Project Conventions
+
+<!-- This file is loaded into the agent's system prompt by default.
+     Edit it to describe your project's coding standards, architecture,
+     and any rules the agent should follow. -->
+
+## General
+
+- Keep changes minimal and focused.
+- Follow existing code style.
+
+<!-- Add more sections as needed:
+- Architecture
+- Testing
+- Git workflow
+- Deployment
+-->
+"#
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// lim serve (`lim serve ...`)
+// ---------------------------------------------------------------------------
+
+/// `lim serve` — unified entry point for long-running server modes.
+///
+/// Parses CLI flags into [`lim_serve::ServeOptions`], constructs a
+/// [`lim_serve::ServeRunner`], and runs it. Defaults for `--protocol` and
+/// `--daemon` fall back to the `[serve]` config section when the flag is
+/// omitted, then to built-in defaults (`all` / foreground).
+#[allow(clippy::too_many_arguments)]
+async fn run_serve(
+    protocol: Option<&str>,
+    daemon: bool,
+    system: Option<&str>,
+    workspace: Option<Utf8PathBuf>,
+    config: Option<Utf8PathBuf>,
+    endpoint: Option<String>,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
+    use lim_serve::{RunMode, ServeOptions, ServeRunner, SystemAction};
+
+    // Load workspace config to resolve [serve] defaults. Non-fatal: if
+    // config loading fails, we fall back to built-in defaults.
+    let serve_cfg = load_serve_config().unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "failed to load [serve] config, using built-in defaults");
+        None
+    });
+
+    // Resolve effective protocol: CLI flag > [serve].protocol > "all".
+    let protocol_str = protocol
+        .or_else(|| serve_cfg.as_ref().and_then(|c| c.protocol.as_deref()))
+        .unwrap_or("all");
+    let protocol_set = parse_protocol_set(protocol_str)?;
+
+    // Resolve effective mode: --daemon > --system > [serve].mode > foreground.
+    let mode = if daemon {
+        RunMode::Daemon
+    } else if let Some(action_str) = system {
+        let action = SystemAction::parse(action_str).ok_or_else(|| {
+            lim_core::error::LimError::Config(format!(
+                "invalid --system action `{action_str}` (expected: install/uninstall/start/stop/status/restart)"
+            ))
+        })?;
+        RunMode::System(action)
+    } else if serve_cfg
+        .as_ref()
+        .and_then(|c| c.mode.as_deref())
+        .map(|m| m.eq_ignore_ascii_case("daemon"))
+        .unwrap_or(false)
+    {
+        RunMode::Daemon
+    } else {
+        RunMode::Foreground
+    };
+
+    let options = ServeOptions {
+        protocol: protocol_set,
+        mode,
+        workspace: workspace.map(|p| p.as_std_path().to_path_buf()),
+        config_path: config.map(|p| p.as_std_path().to_path_buf()),
+        bind_endpoint: endpoint,
+        auth_token,
+    };
+
+    eprintln!("Mode:     {}", format_run_mode(&options.mode));
+    eprintln!("Protocol: {}", format_protocol_set(&options.protocol));
+
+    // Whether the goal daemon should be active. Defaults to true.
+    let goal_daemon_enabled = serve_cfg.as_ref().map(|c| c.goal_daemon.enabled).unwrap_or(true);
+    eprintln!(
+        "Goal daemon: {}",
+        if goal_daemon_enabled { "enabled (built-in)" } else { "disabled" }
+    );
+
+    let runner = ServeRunner::new(options);
+    runner.run().await?;
+    Ok(())
+}
+
+/// Load the `[serve]` section from the workspace config, if any.
+///
+/// Returns `Ok(None)` when no config file is found or the `[serve]` section
+/// is absent. Errors from config loading (parse failures etc.) are propagated
+/// so the caller can decide whether to warn or abort.
+fn load_serve_config() -> anyhow::Result<Option<lim_config::ServeConfig>> {
+    use lim_config::{ConfigLoader, ProjectPaths, XdgPaths};
+    let xdg = XdgPaths::detect()?;
+    let project = ProjectPaths::detect()?;
+    let loader = ConfigLoader::new(xdg, project);
+    let loaded = loader.load()?;
+    Ok(loaded.workspace.serve)
+}
+
+/// Parse the `--protocol` CLI string into a `ProtocolSet`.
+fn parse_protocol_set(s: &str) -> anyhow::Result<lim_serve::ProtocolSet> {
+    use lim_serve::{ProtocolKind, ProtocolSet};
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("all") {
+        return Ok(ProtocolSet::All);
+    }
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(ProtocolSet::None);
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "mcp" => Ok(ProtocolSet::Single(ProtocolKind::Mcp)),
+        "a2a" => Ok(ProtocolSet::Single(ProtocolKind::A2a)),
+        other => Err(lim_core::error::LimError::Config(format!(
+            "unknown protocol `{other}` (expected: all, mcp, a2a, none)"
+        ))
+        .into()),
+    }
+}
+
+/// Format a `RunMode` for display.
+fn format_run_mode(mode: &lim_serve::RunMode) -> String {
+    use lim_serve::RunMode;
+    match mode {
+        RunMode::Foreground => "foreground".to_string(),
+        RunMode::Daemon => "daemon".to_string(),
+        RunMode::System(action) => format!("system({action:?})"),
+    }
+}
+
+/// Format a `ProtocolSet` for display.
+fn format_protocol_set(set: &lim_serve::ProtocolSet) -> String {
+    use lim_serve::ProtocolSet;
+    match set {
+        ProtocolSet::None => "none".to_string(),
+        ProtocolSet::Single(p) => format!("{p:?}").to_lowercase(),
+        ProtocolSet::All => "all".to_string(),
+    }
 }

@@ -30,14 +30,14 @@ cargo build --release
 在项目根目录创建 `.lim/config.toml`：
 
 ```toml
-[[providers]]
-name = "anthropic"
+default_provider = "anthropic"
+
+[providers.anthropic]
 type = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 default_model = "claude-sonnet-4-20250514"
 
-[[providers]]
-name = "openai"
+[providers.openai]
 type = "openai-chat"
 api_key_env = "OPENAI_API_KEY"
 default_model = "gpt-4o"
@@ -68,6 +68,18 @@ lim loop --list
 
 # 启动 TUI 交互界面
 lim tui
+
+# 启动 serve 模式（MCP + A2A + goal daemon 统一入口）
+lim serve                              # 前台运行，all 协议 + goal daemon
+lim serve --protocol mcp               # 仅 MCP server (测试用)
+lim serve --protocol a2a               # 仅 A2A agent (测试用)
+lim serve --protocol none              # 仅 goal daemon
+lim serve --daemon                     # 后台运行
+
+# goal 管理命令（loop-daemon 子集的首选别名）
+lim goal submit --goal "refactor module X"
+lim goal list
+lim goal status <goal_id>
 ```
 
 ## 架构概览
@@ -103,6 +115,8 @@ lim tui
 | `lim-skills` | Skill 加载：YAML frontmatter + markdown body，project 覆盖 global |
 | `lim-tools` | 内置工具：read、write、edit、shell、loop_control |
 | `lim-executor` | 执行器：本地命令执行、策略控制 |
+| `lim-transport` | 传输层：T1+ 跨进程通信、MCP/A2A 协议适配、服务发现 |
+| `lim-serve` | serve 统一入口：MCP/A2A server + daemon/system 模式 |
 | `lim-workflow` | 工作流：DAG 图、节点执行、artifact 管理 |
 | `apps/cli` | CLI 前端：子命令分发、参数解析 |
 | `apps/tui` | TUI 前端：ratatui + crossterm |

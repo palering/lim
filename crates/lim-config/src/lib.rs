@@ -38,4 +38,7 @@ pub use context_loader::{LoadedContext, load_context_files};
 pub use error::{ConfigError, ConfigResult};
 pub use loader::ConfigLoader;
 pub use paths::{ProjectPaths, XdgPaths};
-pub use schema::{ContextFileConfig, ContextFileEntry, ContextSearch, WorkspaceConfig};
+pub use schema::{
+    ContextFileConfig, ContextFileEntry, ContextSearch, GoalDaemonConfig, ServeConfig,
+    SystemServiceConfig, WorkspaceConfig,
+};

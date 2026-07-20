@@ -13,3 +13,6 @@ Cargo.lock
 
 # Local lim config — may contain plaintext API keys during dev.
 /.lim/
+
+# Manual acceptance test workspace (contains plaintext API keys + test artifacts)
+/manual-test/

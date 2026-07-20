@@ -10,6 +10,8 @@ members = [
     "crates/lim-tools",
     "crates/lim-session",
     "crates/lim-workflow",
+    "crates/lim-transport",
+    "crates/lim-serve",
     "apps/cli",
     "apps/tui",
     "packs/novel",
@@ -20,6 +22,7 @@ edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/palering/lim"
+authors = ["lim contributors"]
 
 [workspace.dependencies]
 # Internal crates
@@ -32,6 +35,8 @@ lim-tools = { path = "crates/lim-tools" }
 lim-session = { path = "crates/lim-session" }
 lim-workflow = { path = "crates/lim-workflow" }
 lim-skills = { path = "crates/lim-skills" }
+lim-transport = { path = "crates/lim-transport" }
+lim-serve = { path = "crates/lim-serve" }
 lim-tui = { path = "apps/tui" }
 novel-pack = { path = "packs/novel" }
 

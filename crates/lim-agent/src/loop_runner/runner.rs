@@ -585,6 +585,32 @@ impl LoopRunner {
         Ok((goal_id, result))
     }
 
+    /// Run an already-created goal (the goal state exists in the ledger but
+    /// the loop has not started yet).
+    ///
+    /// This is the daemon-friendly variant of [`start_goal`](Self::start_goal):
+    /// the daemon's `Submit` command creates the goal in the ledger (getting
+    /// back a `GoalId`), then spawns a [`GoalRunner`] task that calls this
+    /// method. Unlike [`resume_goal`](Self::resume_goal), this emits
+    /// `GoalStarted` (not `GoalResumed`) and does not reset the no-progress
+    /// detector (a fresh goal has nothing to reset).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the goal does not exist in the ledger, or if the
+    /// goal loop encounters an unrecoverable error.
+    pub async fn run_existing_goal(&self, goal_id: &GoalId) -> Result<GoalResult> {
+        let state = self.ledger.load(goal_id).await?;
+        info!(goal_id = %goal_id, goal = %state.goal, "running existing goal");
+        let persister = self.spawn_loop_event_persister(goal_id);
+        self.emit(LoopEvent::GoalStarted { goal_id: *goal_id, goal: state.goal.clone() });
+        let result = self.run_goal_loop(goal_id).await?;
+        if let Some(p) = persister {
+            p.finish().await;
+        }
+        Ok(result)
+    }
+
     /// Resume an existing goal that was interrupted or paused.
     ///
     /// Resets the no-progress detector — a human-initiated resume is treated
